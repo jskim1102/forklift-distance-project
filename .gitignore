@@ -1,0 +1,49 @@
+# env (실값/시크릿 — git 에 안 올림, RULES §4.1. .env.example 만 올림)
+.env
+backend/.env
+
+# 하네스 인프라 (add-cto 설치 — 모듈 deliverable 아님, git 제외. 디스크엔 유지)
+.claude/
+
+# 내부 빌드 입력/기록 (공개 불필요) — specs 전체(USAGE.md 포함) + plan.md
+plan.md
+specs/
+
+# extract 소스 read-only 클론 (prime 라인번호 고정용 — git deliverable 아님)
+.sources/
+
+# python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# DB (경로 무관 — 글로벌)
+*.db
+*.sqlite
+*.sqlite3
+# 데이터 이전 전 안전 백업(예: deepeye.db.pre-rename.bak)
+*.db.*.bak
+
+# node
+node_modules/
+dist/
+
+# misc
+.DS_Store
+*.log
+.gstack/
+
+# host dev 러너 (dev.sh) — 런타임 산출물
+.dev.pids
+.dev-logs/
+.analysis/
+
+# detection 런타임 — preset 가중치는 필요 시 자동 다운로드되며 소스가 아니다.
+*.pt
+backend/models/
+
+# --- 대시보드에서 제외 (harness) ---
+/sample/
+/.source/

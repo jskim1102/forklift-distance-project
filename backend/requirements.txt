@@ -1,0 +1,18 @@
+# forklift-distance backend deps — WebRTC/mediamtx control plane + calibration + YOLO detection.
+# 버전은 .sources/ai-monitoring 정본에서 가져옴; alembic/pytest 는 net-new(미고정).
+fastapi==0.135.2
+uvicorn==0.42.0
+sqlalchemy==2.0.48
+pydantic==2.12.5
+python-dotenv==1.2.2
+httpx==0.28.1
+alembic
+pytest
+# calibration + detection. torch/ultralytics는 별도 worker process에서만 import한다.
+ultralytics==8.4.41
+torch==2.7.1
+torchvision==0.22.1
+opencv-python-headless==4.13.0.92
+numpy==2.4.4
+python-multipart==0.0.27
+websockets==16.0
