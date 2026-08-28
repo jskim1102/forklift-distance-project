@@ -311,7 +311,7 @@ def get_ipcam_calibration(stream_key: str, db: Session = Depends(get_db)) -> dic
 def update_ipcam_calibration(
     stream_key: str, body: CalibrationUpdate, db: Session = Depends(get_db)
 ) -> dict:
-    """N점(4~12) pixel/world 좌표 → homography 산출 → 저장."""
+    """N점(4~20) pixel/world 좌표 → homography 산출 → 저장."""
     cam = db.query(IpCam).filter(IpCam.stream_key == stream_key).first()
     if not cam:
         raise HTTPException(status_code=404, detail="IP CAM을 찾을 수 없습니다")

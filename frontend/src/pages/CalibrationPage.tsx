@@ -13,7 +13,7 @@ interface Props {
 }
 
 // 풀페이지 calibration 화면 — CamerasPage 의 "calibration" 버튼에서 네비게이션.
-// 큰 영상/스냅샷 위에 지면 기준점 4~12 picking + 거리입력 + 저장(삼각측량·API 는 CalibrationModal verbatim).
+// 큰 영상/스냅샷 위에 지면 기준점 4~20 picking + 거리입력 + 저장(삼각측량·API 는 CalibrationModal verbatim).
 // WHEP <video> 는 페이지 메인 콘텐츠로 항상 렌더 → 디코딩 유지 → 스냅샷이 실 프레임(검은 화면 방지).
 // 첫 디코딩 프레임 도착 시(requestVideoFrameCallback) 자동 grab.
 export default function CalibrationPage({ cam, onBack }: Props) {

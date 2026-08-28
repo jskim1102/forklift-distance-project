@@ -3,7 +3,7 @@ import Modal from "./Modal";
 import { videoClientToNatural, containRect } from "../utils/videoCoords";
 
 const MIN_POINTS = 4;
-const MAX_POINTS = 12;
+export const MAX_POINTS = 20;
 
 type ModalStep = "PLACING_POINTS" | "DISTANCE_INPUT" | "SAVING" | "RESULT";
 

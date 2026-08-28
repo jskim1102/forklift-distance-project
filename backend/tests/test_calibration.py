@@ -181,6 +181,21 @@ def test_too_few_points_rejected():
         )
 
 
+def test_twenty_points_allowed():
+    points = [[i % 5, i // 5] for i in range(20)]
+
+    update = CalibrationUpdate(pixel_points=points, world_points=points)
+
+    assert len(update.pixel_points) == 20
+
+
+def test_twenty_one_points_rejected():
+    points = [[i % 7, i // 7] for i in range(21)]
+
+    with pytest.raises(ValidationError, match="점 개수"):
+        CalibrationUpdate(pixel_points=points, world_points=points)
+
+
 def test_default_calibration_state_shape():
     s = _default_calibration_state()
     assert s["enabled"] is False

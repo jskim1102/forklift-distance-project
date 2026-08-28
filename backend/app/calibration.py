@@ -1,7 +1,7 @@
 """카메라별 거리측정 calibration core.
 
 prime backend (ipcam.py L226-378 + inference/distance.py) 에서 extract.
-사용자가 이미지 위 N점(4~12)의 픽셀↔월드 대응을 주면 단일 평면 homography 를
+사용자가 이미지 위 N점(4~20)의 픽셀↔월드 대응을 주면 단일 평면 homography 를
 `cv2.findHomography` 로 fit 하고, 저장된 H 로 픽셀→월드 변환을 제공한다.
 
 prime 대비 strip:
@@ -18,7 +18,7 @@ from fastapi import HTTPException
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 _MIN_POINTS = 4
-_MAX_POINTS = 12
+_MAX_POINTS = 20
 _K1_MIN = 0.0
 _K1_MAX = 0.6
 _K1_GATE = 0.15
@@ -39,7 +39,7 @@ class CalibrationState(BaseModel):
 
 
 class CalibrationUpdate(BaseModel):
-    """PUT 요청 — N점(4~12) pixel/world 좌표 + homography 산출."""
+    """PUT 요청 — N점(4~20) pixel/world 좌표 + homography 산출."""
     pixel_points: list[list[float]]
     world_points: list[list[float]]
     enabled: bool = True
