@@ -47,3 +47,4 @@ backend/models/
 # --- 대시보드에서 제외 (harness) ---
 /sample/
 /.source/
+/.orca/
