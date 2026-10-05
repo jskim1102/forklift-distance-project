@@ -1,20 +1,22 @@
 import { describe, expect, it } from "vitest";
-import type { Detection } from "../types/detection";
+import type { Detection, SelectedYoloClass } from "../types/detection";
 import {
+  ANCHOR_LANE,
   buildDetectionPairs,
   canApplyMeasurementSettings,
   filterDetectionsByClassConfidence,
   minimumClassConfidence,
-  PERSON_CLASS,
+  reconcileMeasurements,
+  restoreSelection,
+  TARGET_LANE,
 } from "./detectionPairs";
-import type { SelectedYoloClass } from "../types/detection";
 
 function det(
   classId: number,
   name: string,
   x: number,
   conf = 0.9,
-  model = "yolo26x.pt",
+  model = ANCHOR_LANE,
 ): Detection {
   return {
     class_id: classId,
@@ -34,88 +36,111 @@ function selected(
   return { id, name, model, conf };
 }
 
+const ANCHOR_PERSON = selected(0, "person", ANCHOR_LANE);
+const TARGET_FORKLIFT = selected(0, "forklift", TARGET_LANE);
+
 describe("buildDetectionPairs", () => {
-  it("각 preset person마다 custom 객체의 최단거리 1개만 만든다", () => {
-    const p1 = det(0, "person", 0);
-    const p2 = det(0, "person", 100);
-    const c1 = det(0, "forklift", 10, 0.9, "warehouse.pt");
-    const c2 = det(0, "forklift", 80, 0.9, "warehouse.pt");
-    const selection = [PERSON_CLASS, selected(0, "forklift", "warehouse.pt")];
+  it("기준 레인 검출마다 상대 레인의 최단거리 1개만 만든다", () => {
+    const a1 = det(0, "person", 0);
+    const a2 = det(0, "person", 100);
+    const t1 = det(0, "forklift", 10, 0.9, TARGET_LANE);
+    const t2 = det(0, "forklift", 80, 0.9, TARGET_LANE);
 
     expect(
       buildDetectionPairs(
-        [p1, c1, p2, c2],
-        selection,
+        [a1, t1, a2, t2],
+        [ANCHOR_PERSON, TARGET_FORKLIFT],
         (from, to) => Math.abs(from.xyxy[0] - to.xyxy[0]),
       ),
-    ).toEqual([[p1, c1], [p2, c2]]);
+    ).toEqual([[a1, t1], [a2, t2]]);
   });
 
   it("2개 대 1개면 상대 bbox를 재사용해 최단거리 2개를 만든다", () => {
-    const p1 = det(0, "person", 0);
-    const p2 = det(0, "person", 100);
-    const chair = det(0, "forklift", 40, 0.9, "warehouse.pt");
+    const a1 = det(0, "person", 0);
+    const a2 = det(0, "person", 100);
+    const shared = det(0, "forklift", 40, 0.9, TARGET_LANE);
 
     expect(
       buildDetectionPairs(
-        [p1, chair, p2],
-        [PERSON_CLASS, selected(0, "forklift", "warehouse.pt")],
+        [a1, shared, a2],
+        [ANCHOR_PERSON, TARGET_FORKLIFT],
         (from, to) => Math.abs(from.xyxy[0] - to.xyxy[0]),
       ),
-    ).toEqual([[p1, chair], [p2, chair]]);
+    ).toEqual([[a1, shared], [a2, shared]]);
   });
 
-  it("person 1개와 상대 bbox 2개면 가장 가까운 거리 1개만 만든다", () => {
-    const person = det(0, "person", 50);
-    const nearChair = det(0, "forklift", 60, 0.9, "warehouse.pt");
-    const farChair = det(0, "forklift", 150, 0.9, "warehouse.pt");
+  it("기준 1개와 상대 2개면 가장 가까운 거리 1개만 만든다", () => {
+    const anchor = det(0, "person", 50);
+    const near = det(0, "forklift", 60, 0.9, TARGET_LANE);
+    const far = det(0, "forklift", 150, 0.9, TARGET_LANE);
 
     expect(
       buildDetectionPairs(
-        [farChair, person, nearChair],
-        [PERSON_CLASS, selected(0, "forklift", "warehouse.pt")],
+        [far, anchor, near],
+        [ANCHOR_PERSON, TARGET_FORKLIFT],
         (from, to) => Math.abs(from.xyxy[0] - to.xyxy[0]),
       ),
-    ).toEqual([[person, nearChair]]);
+    ).toEqual([[anchor, near]]);
   });
 
-  it("같은 class_id라도 선택하지 않은 custom 모델의 detection은 후보에서 제외한다", () => {
-    const person = det(0, "person", 0);
-    const selectedForklift = det(0, "forklift", 40, 0.9, "warehouse.pt");
-    const otherForklift = det(0, "forklift", 5, 0.9, "other.pt");
+  it("두 레인의 원본 파일명이 같아도 lane id 로 분리한다", () => {
+    // 두 레인 모두 best.pt 를 올린 상황 — detection 의 model 값은 레인 id 다.
+    const anchorBox = det(0, "forklift", 0, 0.9, ANCHOR_LANE);
+    const targetBox = det(0, "forklift", 30, 0.9, TARGET_LANE);
 
     expect(
       buildDetectionPairs(
-        [person, otherForklift, selectedForklift],
-        [PERSON_CLASS, selected(0, "forklift", "warehouse.pt")],
+        [anchorBox, targetBox],
+        [selected(0, "forklift", ANCHOR_LANE), selected(0, "forklift", TARGET_LANE)],
         (from, to) => Math.abs(from.xyxy[0] - to.xyxy[0]),
       ),
-    ).toEqual([[person, selectedForklift]]);
+    ).toEqual([[anchorBox, targetBox]]);
   });
 
-  it("world 좌표를 만들 수 없는 custom 후보는 최단거리 계산에서 건너뛴다", () => {
-    const person = det(0, "person", 0);
-    const invalid = det(0, "forklift", 10, 0.9, "warehouse.pt");
-    const valid = det(0, "forklift", 30, 0.9, "warehouse.pt");
+  it("같은 class_id라도 선택하지 않은 클래스의 검출은 후보에서 제외한다", () => {
+    const anchor = det(0, "person", 0);
+    const chosen = det(0, "forklift", 40, 0.9, TARGET_LANE);
+    const other = det(3, "pallet", 5, 0.9, TARGET_LANE);
 
     expect(
       buildDetectionPairs(
-        [person, invalid, valid],
-        [PERSON_CLASS, selected(0, "forklift", "warehouse.pt")],
+        [anchor, other, chosen],
+        [ANCHOR_PERSON, TARGET_FORKLIFT],
+        (from, to) => Math.abs(from.xyxy[0] - to.xyxy[0]),
+      ),
+    ).toEqual([[anchor, chosen]]);
+  });
+
+  it("world 좌표를 만들 수 없는 상대 후보는 최단거리 계산에서 건너뛴다", () => {
+    const anchor = det(0, "person", 0);
+    const invalid = det(0, "forklift", 10, 0.9, TARGET_LANE);
+    const valid = det(0, "forklift", 30, 0.9, TARGET_LANE);
+
+    expect(
+      buildDetectionPairs(
+        [anchor, invalid, valid],
+        [ANCHOR_PERSON, TARGET_FORKLIFT],
         (_from, to) => (to === invalid ? null : 30),
       ),
-    ).toEqual([[person, valid]]);
+    ).toEqual([[anchor, valid]]);
   });
 
-  it("모델 태그가 다르거나 person+custom 정확한 2개 선택이 아니면 거부한다", () => {
-    const p1 = det(0, "person", 0);
-    const custom = det(0, "forklift", 20, 0.9, "warehouse.pt");
-    expect(buildDetectionPairs([p1, custom], [])).toEqual([]);
-    expect(buildDetectionPairs([p1, custom], [PERSON_CLASS])).toEqual([]);
+  it("레인별 1개씩 정확히 2개 선택이 아니면 거부한다", () => {
+    const anchor = det(0, "person", 0);
+    const target = det(0, "forklift", 20, 0.9, TARGET_LANE);
+
+    expect(buildDetectionPairs([anchor, target], [])).toEqual([]);
+    expect(buildDetectionPairs([anchor, target], [ANCHOR_PERSON])).toEqual([]);
     expect(
       buildDetectionPairs(
-        [p1, custom],
-        [PERSON_CLASS, selected(0, "forklift", "other.pt")],
+        [anchor, target],
+        [ANCHOR_PERSON, selected(1, "pallet", ANCHOR_LANE)],
+      ),
+    ).toEqual([]);
+    expect(
+      buildDetectionPairs(
+        [anchor, target],
+        [ANCHOR_PERSON, selected(0, "forklift", "warehouse.pt")],
       ),
     ).toEqual([]);
   });
@@ -123,29 +148,28 @@ describe("buildDetectionPairs", () => {
 
 describe("filterDetectionsByClassConfidence", () => {
   it("선택한 클래스마다 서로 다른 confidence 임계값을 적용한다", () => {
-    const personLow = det(0, "person", 0, 0.49);
-    const personAtThreshold = det(0, "person", 20, 0.5);
-    const carLow = det(0, "forklift", 40, 0.79, "warehouse.pt");
-    const carHigh = det(0, "forklift", 60, 0.81, "warehouse.pt");
-    const wrongModel = det(0, "forklift", 70, 0.99, "other.pt");
+    const anchorLow = det(0, "person", 0, 0.49);
+    const anchorAtThreshold = det(0, "person", 20, 0.5);
+    const targetLow = det(0, "forklift", 40, 0.79, TARGET_LANE);
+    const targetHigh = det(0, "forklift", 60, 0.81, TARGET_LANE);
     const unselected = det(5, "bus", 80, 0.99);
 
     expect(
       filterDetectionsByClassConfidence(
-        [personLow, personAtThreshold, carLow, carHigh, wrongModel, unselected],
+        [anchorLow, anchorAtThreshold, targetLow, targetHigh, unselected],
         [
-          { ...PERSON_CLASS, conf: 0.5 },
-          selected(0, "forklift", "warehouse.pt", 0.8),
+          selected(0, "person", ANCHOR_LANE, 0.5),
+          selected(0, "forklift", TARGET_LANE, 0.8),
         ],
       ),
-    ).toEqual([personAtThreshold, carHigh]);
+    ).toEqual([anchorAtThreshold, targetHigh]);
   });
 
   it("백엔드 수집 임계값은 선택 클래스 confidence 중 최솟값을 사용한다", () => {
     expect(
       minimumClassConfidence([
-        { ...PERSON_CLASS, conf: 0.7 },
-        selected(0, "forklift", "warehouse.pt", 0.35),
+        selected(0, "person", ANCHOR_LANE, 0.7),
+        selected(0, "forklift", TARGET_LANE, 0.35),
       ]),
     ).toBe(0.35);
   });
@@ -153,13 +177,134 @@ describe("filterDetectionsByClassConfidence", () => {
 
 describe("canApplyMeasurementSettings", () => {
   it("OFF는 클래스 선택 없이 적용할 수 있다", () => {
-    expect(canApplyMeasurementSettings(false, 0, false, false)).toBe(true);
+    expect(canApplyMeasurementSettings(false, false, false, false, false)).toBe(true);
   });
 
-  it("ON은 활성 기준점, custom 가중치, custom 클래스 1개가 모두 필요하다", () => {
-    expect(canApplyMeasurementSettings(true, 0, true, true)).toBe(false);
-    expect(canApplyMeasurementSettings(true, 1, false, true)).toBe(false);
-    expect(canApplyMeasurementSettings(true, 1, true, false)).toBe(false);
-    expect(canApplyMeasurementSettings(true, 1, true, true)).toBe(true);
+  it("ON은 기준점·상대 레인 활성·레인별 클래스 1개가 모두 필요하다", () => {
+    expect(canApplyMeasurementSettings(true, false, true, true, true)).toBe(false);
+    expect(canApplyMeasurementSettings(true, true, false, true, true)).toBe(false);
+    expect(canApplyMeasurementSettings(true, true, true, false, true)).toBe(false);
+    expect(canApplyMeasurementSettings(true, true, true, true, false)).toBe(false);
+    expect(canApplyMeasurementSettings(true, true, true, true, true)).toBe(true);
+  });
+});
+
+describe("restoreSelection", () => {
+  const catalog = {
+    [ANCHOR_LANE]: [{ id: 0, name: "person" }, { id: 2, name: "car" }],
+    [TARGET_LANE]: [{ id: 0, name: "forklift" }],
+  };
+
+  it("레인·id·이름이 모두 맞으면 복원한다", () => {
+    const stored = [ANCHOR_PERSON, TARGET_FORKLIFT];
+
+    expect(restoreSelection(stored, catalog)).toEqual({
+      classes: stored,
+      dropped: false,
+    });
+  });
+
+  it("레인 id 가 아닌 model 은 폐기한다", () => {
+    const stored = [selected(0, "person", "yolo26x.pt"), TARGET_FORKLIFT];
+
+    expect(restoreSelection(stored, catalog)).toEqual({
+      classes: [TARGET_FORKLIFT],
+      dropped: true,
+    });
+  });
+
+  it("비활성 레인의 선택은 폐기한다", () => {
+    const stored = [ANCHOR_PERSON, TARGET_FORKLIFT];
+
+    expect(restoreSelection(stored, { [ANCHOR_LANE]: catalog[ANCHOR_LANE], [TARGET_LANE]: null })).toEqual({
+      classes: [ANCHOR_PERSON],
+      dropped: true,
+    });
+  });
+
+  it("클래스 목록에 없는 id 는 폐기한다", () => {
+    const stored = [selected(7, "pallet", ANCHOR_LANE), TARGET_FORKLIFT];
+
+    expect(restoreSelection(stored, catalog)).toEqual({
+      classes: [TARGET_FORKLIFT],
+      dropped: true,
+    });
+  });
+
+  it("id 는 같아도 이름이 바뀌었으면 폐기한다", () => {
+    const stored = [ANCHOR_PERSON, selected(0, "pallet", TARGET_LANE)];
+
+    expect(restoreSelection(stored, catalog)).toEqual({
+      classes: [ANCHOR_PERSON],
+      dropped: true,
+    });
+  });
+});
+
+describe("reconcileMeasurements", () => {
+  const catalog = {
+    [ANCHOR_LANE]: [{ id: 0, name: "person" }],
+    [TARGET_LANE]: [{ id: 0, name: "forklift" }],
+  };
+
+  it("무효화가 없으면 disabled 가 비고 enabled 가 유지된다", () => {
+    const measurements = {
+      "ipcam-a": { enabled: true, classes: [ANCHOR_PERSON, TARGET_FORKLIFT] },
+      "ipcam-b": { enabled: false, classes: [ANCHOR_PERSON, TARGET_FORKLIFT] },
+    };
+
+    expect(reconcileMeasurements(measurements, catalog)).toEqual({
+      next: measurements,
+      disabled: [],
+    });
+  });
+
+  it("무효화된 카메라 키를 disabled 로 모으고 enabled 를 내린다", () => {
+    // 상대 레인 가중치가 교체돼 forklift 가 사라진 상황.
+    const replaced = {
+      [ANCHOR_LANE]: catalog[ANCHOR_LANE],
+      [TARGET_LANE]: [{ id: 0, name: "pallet" }],
+    };
+    const measurements = {
+      "ipcam-a": { enabled: true, classes: [ANCHOR_PERSON, TARGET_FORKLIFT] },
+      "ipcam-b": { enabled: true, classes: [ANCHOR_PERSON, TARGET_FORKLIFT] },
+    };
+
+    expect(reconcileMeasurements(measurements, replaced)).toEqual({
+      next: {
+        "ipcam-a": { enabled: false, classes: [ANCHOR_PERSON] },
+        "ipcam-b": { enabled: false, classes: [ANCHOR_PERSON] },
+      },
+      disabled: ["ipcam-a", "ipcam-b"],
+    });
+  });
+
+  it("이미 꺼져 있던 카메라는 disabled 에 넣지 않는다", () => {
+    const measurements = {
+      "ipcam-a": { enabled: false, classes: [ANCHOR_PERSON, TARGET_FORKLIFT] },
+    };
+
+    expect(reconcileMeasurements(measurements, { [ANCHOR_LANE]: catalog[ANCHOR_LANE], [TARGET_LANE]: null })).toEqual({
+      next: { "ipcam-a": { enabled: false, classes: [ANCHOR_PERSON] } },
+      disabled: [],
+    });
+  });
+
+  it("어긋난 레인의 선택만 비우고 반대쪽은 유지한다", () => {
+    const measurements = {
+      "ipcam-a": { enabled: true, classes: [ANCHOR_PERSON, TARGET_FORKLIFT] },
+    };
+
+    const result = reconcileMeasurements(measurements, {
+      [ANCHOR_LANE]: null,
+      [TARGET_LANE]: catalog[TARGET_LANE],
+    });
+
+    expect(result.next["ipcam-a"].classes).toEqual([TARGET_FORKLIFT]);
+    expect(result.disabled).toEqual(["ipcam-a"]);
+  });
+
+  it("빈 목록은 빈 결과를 돌려준다", () => {
+    expect(reconcileMeasurements({}, catalog)).toEqual({ next: {}, disabled: [] });
   });
 });

@@ -3,6 +3,7 @@ export interface Detection {
   name: string;
   conf: number;
   xyxy: [number, number, number, number];
+  // lane id ("anchor" | "target")
   model: string;
 }
 
@@ -12,6 +13,7 @@ export interface YoloClass {
 }
 
 export interface SelectedYoloClass extends YoloClass {
+  // lane id ("anchor" | "target")
   model: string;
   conf: number;
 }
@@ -21,14 +23,18 @@ export interface AutoMeasurement {
   classes: SelectedYoloClass[];
 }
 
-export interface CustomWeightsStatus {
+export interface LaneStatus {
+  lane: string;
+  source: "preset" | "upload";
   name: string;
-  uploaded_at: string;
-  size_mb: number;
+  uploaded_at: string | null;
+  size_mb: number | null;
   class_count: number;
 }
 
 export interface WeightsStatus {
-  preset_name: string;
-  custom: CustomWeightsStatus | null;
+  lanes: {
+    anchor: LaneStatus;
+    target: LaneStatus | null;
+  };
 }

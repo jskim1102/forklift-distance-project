@@ -1,21 +1,26 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { apiBase } from "../hooks/useApi";
 import type {
   AutoMeasurement,
+  LaneStatus,
   SelectedYoloClass,
   WeightsStatus,
   YoloClass,
 } from "../types/detection";
+import type { LaneClassCatalog } from "../utils/detectionPairs";
 import {
+  ANCHOR_LANE,
+  isLaneId,
   minimumClassConfidence,
   modelClassKey,
   normalizeClassConfidence,
-  PERSON_CLASS_ID,
-  PERSON_MODEL,
+  reconcileMeasurements,
+  TARGET_LANE,
 } from "../utils/detectionPairs";
 import CameraFormModal from "../components/CameraFormModal";
 import CameraGrid from "../components/CameraGrid";
 import MeasurementClassModal from "../components/MeasurementClassModal";
+import type { LaneClasses } from "../components/MeasurementClassModal";
 
 export interface Cam {
   id: number;
@@ -31,12 +36,24 @@ interface Stat {
 }
 
 const MAX_IPCAMS_FALLBACK = 16; // spec F4 — /api/config 로딩 전 기본값. 실제 cap 은 백엔드 env.
-const MEASURE_STORAGE_KEY = "forklift-distance:auto-measure:v1";
+// v2 — 모델 식별자가 파일명에서 레인 id 로 바뀌어 v1 데이터는 살릴 수 없다. 키를 올려 조용히 폐기한다.
+export const MEASURE_STORAGE_KEY = "forklift-distance:auto-measure:v2";
+const LEGACY_MEASURE_STORAGE_KEYS = ["forklift-distance:auto-measure:v1"];
 const EMPTY_CLASSES: SelectedYoloClass[] = [];
+const EMPTY_LANE_CLASSES: LaneClasses = { [ANCHOR_LANE]: [], [TARGET_LANE]: [] };
 
-function loadStoredMeasurements(): Record<string, AutoMeasurement> {
+interface MeasurementStorage {
+  getItem: (key: string) => string | null;
+  removeItem: (key: string) => void;
+}
+
+export function loadStoredMeasurements(
+  storage?: MeasurementStorage,
+): Record<string, AutoMeasurement> {
+  const store = storage ?? window.localStorage;
   try {
-    const parsed = JSON.parse(window.localStorage.getItem(MEASURE_STORAGE_KEY) ?? "{}") as Record<
+    for (const legacy of LEGACY_MEASURE_STORAGE_KEYS) store.removeItem(legacy);
+    const parsed = JSON.parse(store.getItem(MEASURE_STORAGE_KEY) ?? "{}") as Record<
       string,
       Partial<AutoMeasurement>
     >;
@@ -47,6 +64,7 @@ function loadStoredMeasurements(): Record<string, AutoMeasurement> {
               typeof item?.id === "number"
                 && typeof item?.name === "string"
                 && typeof item?.model === "string"
+                && isLaneId(item.model)
                 ? [{
                     id: item.id,
                     name: item.name,
@@ -60,11 +78,9 @@ function loadStoredMeasurements(): Record<string, AutoMeasurement> {
               )) === index
             )).slice(0, 2)
           : [];
-        const hasPerson = classes.some(
-          (item) => item.model === PERSON_MODEL && item.id === PERSON_CLASS_ID,
-        );
-        const hasCustom = classes.some((item) => item.model !== PERSON_MODEL);
-        if (classes.length !== 2 || !hasPerson || !hasCustom) return [];
+        const hasAnchor = classes.some((item) => item.model === ANCHOR_LANE);
+        const hasTarget = classes.some((item) => item.model === TARGET_LANE);
+        if (classes.length !== 2 || !hasAnchor || !hasTarget) return [];
         return [[streamKey, { enabled: value.enabled === true, classes }]];
       }),
     );
@@ -76,6 +92,22 @@ function loadStoredMeasurements(): Record<string, AutoMeasurement> {
 interface Props {
   // calibration 버튼 → App 이 풀페이지 CalibrationPage 로 전환.
   onCalibrate: (cam: Cam) => void;
+}
+
+async function loadLaneClasses(lane: string, status: LaneStatus | null): Promise<YoloClass[]> {
+  if (status == null) return [];
+  const response = await fetch(`${apiBase()}/api/inference/lanes/${lane}/classes`);
+  if (response.status === 404) return [];
+  if (!response.ok) throw new Error("레인 클래스 목록을 불러오지 못했습니다.");
+  return response.json() as Promise<YoloClass[]>;
+}
+
+async function loadAllLaneClasses(status: WeightsStatus): Promise<LaneClasses> {
+  const [anchor, target] = await Promise.all([
+    loadLaneClasses(ANCHOR_LANE, status.lanes.anchor),
+    loadLaneClasses(TARGET_LANE, status.lanes.target),
+  ]);
+  return { [ANCHOR_LANE]: anchor, [TARGET_LANE]: target };
 }
 
 export default function CamerasPage({ onCalibrate }: Props) {
@@ -91,9 +123,10 @@ export default function CamerasPage({ onCalibrate }: Props) {
   const [autoMeasurements, setAutoMeasurements] = useState<Record<string, AutoMeasurement>>(
     loadStoredMeasurements,
   );
+  const measurementsRef = useRef(autoMeasurements);
   const [measureTarget, setMeasureTarget] = useState<Cam | null>(null);
   const [measureCanEnable, setMeasureCanEnable] = useState(false);
-  const [yoloClasses, setYoloClasses] = useState<YoloClass[]>([]);
+  const [laneClasses, setLaneClasses] = useState<LaneClasses>(EMPTY_LANE_CLASSES);
   const [weights, setWeights] = useState<WeightsStatus | null>(null);
   const [weightsBusy, setWeightsBusy] = useState(false);
   const [weightsError, setWeightsError] = useState("");
@@ -112,6 +145,7 @@ export default function CamerasPage({ onCalibrate }: Props) {
   }, [fetchCams]);
 
   useEffect(() => {
+    measurementsRef.current = autoMeasurements;
     window.localStorage.setItem(MEASURE_STORAGE_KEY, JSON.stringify(autoMeasurements));
   }, [autoMeasurements]);
 
@@ -198,26 +232,70 @@ export default function CamerasPage({ onCalibrate }: Props) {
     await fetchCams();
   }
 
+  /**
+   * 저장된 선택을 현재 레인 상태로 다시 검증한다.
+   *
+   * 어긋난 레인의 선택만 비우고, 그 카메라의 enabled 는 내린다. 프론트만 끄면 백엔드
+   * per-source 는 켜진 채 남으므로 PUT {enabled:false} 로 함께 맞춘다. 판정은 순수
+   * 함수가 하고 여기서는 상태 반영과 전송만 한다 — setState 업데이터는 동기 실행이
+   * 보장되지 않아 그 안에서 모은 목록은 호출 직후 비어 있다.
+   */
+  const syncMeasurementsWithLanes = useCallback(async (catalog: LaneClassCatalog) => {
+    const { next, disabled } = reconcileMeasurements(measurementsRef.current, catalog);
+    measurementsRef.current = next;
+    setAutoMeasurements(next);
+    setSelectionResetToken((current) => current + 1);
+    await Promise.all(
+      disabled.map((streamKey) =>
+        fetch(`${apiBase()}/api/ipcams/${streamKey}/inference`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: false }),
+        }).catch(() => undefined),
+      ),
+    );
+  }, []);
+
+  // 재접속 직후에도 모델 교체를 감지한다. 모달을 열어야만 검증되면 저장된
+  // 클래스 id가 다른 객체를 가리키는 동안 자동 측정이 계속 표시될 수 있다.
+  useEffect(() => {
+    let cancelled = false;
+    async function restoreMeasurements() {
+      const response = await fetch(`${apiBase()}/api/inference/weights`);
+      if (!response.ok) throw new Error("활성 가중치 정보를 불러오지 못했습니다.");
+      const nextWeights = await response.json() as WeightsStatus;
+      const nextClasses = await loadAllLaneClasses(nextWeights);
+      if (cancelled) return;
+      setWeights(nextWeights);
+      setLaneClasses(nextClasses);
+      await syncMeasurementsWithLanes(nextClasses);
+    }
+    restoreMeasurements().catch((reason) => {
+      if (!cancelled) {
+        setError(reason instanceof Error ? reason.message : "저장된 측정 설정을 확인하지 못했습니다.");
+      }
+    });
+    return () => { cancelled = true; };
+  }, [syncMeasurementsWithLanes]);
+
   async function openAutoMeasurementSettings(cam: Cam) {
     setError("");
     setWeightsError("");
     setMeasureBusyKey(cam.stream_key);
     try {
-      const [calibrationResp, weightsResp, classesResp] = await Promise.all([
+      const [calibrationResp, weightsResp] = await Promise.all([
         fetch(`${apiBase()}/api/ipcams/${cam.stream_key}/calibration`),
         fetch(`${apiBase()}/api/inference/weights`),
-        fetch(`${apiBase()}/api/inference/classes`),
       ]);
       if (!calibrationResp.ok) throw new Error("기준점 정보를 불러오지 못했습니다.");
       if (!weightsResp.ok) throw new Error("활성 가중치 정보를 불러오지 못했습니다.");
       const calibration = await calibrationResp.json();
       const nextWeights = (await weightsResp.json()) as WeightsStatus;
-      if (!classesResp.ok && !(classesResp.status === 404 && nextWeights.custom == null)) {
-        throw new Error("Custom YOLO 클래스 목록을 불러오지 못했습니다.");
-      }
+      const nextClasses = await loadAllLaneClasses(nextWeights);
       setMeasureCanEnable(Boolean(calibration.enabled && calibration.homography));
       setWeights(nextWeights);
-      setYoloClasses(classesResp.ok ? (await classesResp.json()) as YoloClass[] : []);
+      setLaneClasses(nextClasses);
+      await syncMeasurementsWithLanes(nextClasses);
       setMeasureTarget(cam);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "자동 측정 설정에 실패했습니다.");
@@ -226,42 +304,36 @@ export default function CamerasPage({ onCalibrate }: Props) {
     }
   }
 
-  function resetAllMeasurementSelections() {
-    window.localStorage.removeItem(MEASURE_STORAGE_KEY);
-    setAutoMeasurements({});
-    setSelectionResetToken((current) => current + 1);
-  }
-
   async function readResponseError(response: Response, fallback: string): Promise<string> {
     const body = await response.json().catch(() => null) as { detail?: unknown } | null;
     return typeof body?.detail === "string" ? body.detail : fallback;
   }
 
-  async function loadActiveClasses(): Promise<YoloClass[]> {
-    const response = await fetch(`${apiBase()}/api/inference/classes`);
-    if (response.status === 404) return [];
-    if (!response.ok) throw new Error("Custom 가중치의 클래스 목록을 불러오지 못했습니다.");
-    return response.json() as Promise<YoloClass[]>;
+  async function applyLaneWeightsChange(
+    response: Response,
+    fallbackMessage: string,
+  ): Promise<void> {
+    if (!response.ok) throw new Error(await readResponseError(response, fallbackMessage));
+    const nextWeights = (await response.json()) as WeightsStatus;
+    const nextClasses = await loadAllLaneClasses(nextWeights);
+    setWeights(nextWeights);
+    setLaneClasses(nextClasses);
+    await syncMeasurementsWithLanes(nextClasses);
   }
 
-  async function uploadWeights(file: File) {
+  async function uploadWeights(lane: string, file: File) {
     setWeightsBusy(true);
     setWeightsError("");
     try {
       const form = new FormData();
       form.append("file", file);
-      const response = await fetch(`${apiBase()}/api/inference/weights`, {
-        method: "POST",
-        body: form,
-      });
-      if (!response.ok) {
-        throw new Error(await readResponseError(response, "가중치 업로드에 실패했습니다."));
-      }
-      const nextWeights = (await response.json()) as WeightsStatus;
-      setWeights(nextWeights);
-      resetAllMeasurementSelections();
-      setYoloClasses([]);
-      setYoloClasses(await loadActiveClasses());
+      await applyLaneWeightsChange(
+        await fetch(`${apiBase()}/api/inference/lanes/${lane}/weights`, {
+          method: "POST",
+          body: form,
+        }),
+        "가중치 업로드에 실패했습니다.",
+      );
     } catch (reason) {
       setWeightsError(reason instanceof Error ? reason.message : "가중치 업로드에 실패했습니다.");
     } finally {
@@ -269,21 +341,18 @@ export default function CamerasPage({ onCalibrate }: Props) {
     }
   }
 
-  async function resetWeights() {
+  async function resetWeights(lane: string) {
     setWeightsBusy(true);
     setWeightsError("");
     try {
-      const response = await fetch(`${apiBase()}/api/inference/weights`, { method: "DELETE" });
-      if (!response.ok) {
-        throw new Error(await readResponseError(response, "기본 가중치 복귀에 실패했습니다."));
-      }
-      const nextWeights = (await response.json()) as WeightsStatus;
-      setWeights(nextWeights);
-      resetAllMeasurementSelections();
-      setYoloClasses([]);
-      setYoloClasses(await loadActiveClasses());
+      await applyLaneWeightsChange(
+        await fetch(`${apiBase()}/api/inference/lanes/${lane}/weights`, { method: "DELETE" }),
+        "업로드 가중치 제거에 실패했습니다.",
+      );
     } catch (reason) {
-      setWeightsError(reason instanceof Error ? reason.message : "기본 가중치 복귀에 실패했습니다.");
+      setWeightsError(
+        reason instanceof Error ? reason.message : "업로드 가중치 제거에 실패했습니다.",
+      );
     } finally {
       setWeightsBusy(false);
     }
@@ -295,7 +364,7 @@ export default function CamerasPage({ onCalibrate }: Props) {
     setError("");
     try {
       if (!weights) throw new Error("활성 가중치 정보를 불러오지 못했습니다.");
-      if (enabled && !weights.custom) throw new Error("Custom 가중치를 먼저 업로드하세요.");
+      if (enabled && !weights.lanes.target) throw new Error("상대 레인 가중치 업로드 필요");
       const resp = await fetch(`${apiBase()}/api/ipcams/${measureTarget.stream_key}/inference`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
@@ -303,7 +372,7 @@ export default function CamerasPage({ onCalibrate }: Props) {
           enabled
             ? {
                 enabled: true,
-                models: [weights.preset_name, weights.custom!.name],
+                models: [ANCHOR_LANE, TARGET_LANE],
                 conf_threshold: minimumClassConfidence(classes),
               }
             : { enabled: false },
@@ -577,7 +646,7 @@ export default function CamerasPage({ onCalibrate }: Props) {
             <span className="badge none">{cams.length} CH</span>
           </div>
           <div className="live-grid-body">
-            <CameraGrid cams={cams} onFps={handleFps} autoMeasurements={autoMeasurements} />
+            <CameraGrid cams={cams} onFps={handleFps} autoMeasurements={weights == null ? {} : autoMeasurements} />
           </div>
         </section>
       </div>
@@ -591,7 +660,7 @@ export default function CamerasPage({ onCalibrate }: Props) {
       <MeasurementClassModal
         open={measureTarget != null}
         cameraName={measureTarget?.name ?? ""}
-        classes={yoloClasses}
+        laneClasses={laneClasses}
         initialEnabled={
           measureTarget ? autoMeasurements[measureTarget.stream_key]?.enabled ?? false : false
         }

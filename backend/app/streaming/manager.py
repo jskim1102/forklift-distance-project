@@ -37,7 +37,7 @@ from app.config import (
     MIN_INFERENCE_INTERVAL,
 )
 from app.inference import FrameRequest, InferenceResult, InferenceWorker
-from app.inference.models_dir import get_active_model_names
+from app.inference.models_dir import get_active_lanes
 from app.streaming.capture import SourceType, VideoCaptureThread
 
 logger = logging.getLogger("rtsp-streaming.streaming.manager")
@@ -284,11 +284,11 @@ class StreamManager:
         # source_id 별 confidence threshold — key 없으면 worker 의 global 값 사용
         self._per_source_conf: dict[str, float] = {}
         # source_id 별 사용 모델 목록.
-        #   key 없음 → 현재 고정 preset + 선택적 custom 기본 조합 사용
+        #   key 없음 → 현재 활성 레인 조합(anchor + 선택적 target) 사용
         #   [] (빈 리스트) → 이 카메라 추론 안 함 (bbox 없음)
         #   [m1, m2, ...] → 해당 모델 lane들을 병렬 사용하고 결과를 합침
         self._per_source_models: dict[str, list[str]] = {}
-        self._default_source_models: list[str] = get_active_model_names()
+        self._default_source_models: list[str] = get_active_lanes()
         self._per_source_lock = threading.Lock()
 
         # H1: 최근 삭제 source_id → 삭제 monotonic 시각. start_capture 의 create 분기가 참조해
@@ -1033,7 +1033,7 @@ class StreamManager:
     def get_source_models(self, source_id: str) -> list[str]:
         """source_id 의 per-source 모델 목록.
 
-        - 미설정: 현재 기본 조합(yolo26x + 선택적 custom)을 반환
+        - 미설정: 현재 활성 레인 조합(anchor + 선택적 target)을 반환
         - []  : 명시적 추론 안 함
         - [m1, m2, ...]: 해당 모델들
         """
@@ -1085,7 +1085,7 @@ class StreamManager:
         )
 
     def reload_source_model(self, model_name: str) -> None:
-        """동일 이름으로 교체된 custom lane만 재시작한다."""
+        """가중치 파일만 교체된 레인 lane 을 재시작한다."""
         self._worker.reload_model(model_name)
         self._recompute_cadence()
 

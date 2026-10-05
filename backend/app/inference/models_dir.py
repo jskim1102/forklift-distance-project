@@ -1,14 +1,21 @@
-"""고정 YOLO preset + 보조 custom 가중치 관리.
+"""레인 슬롯 기반 YOLO 가중치 관리.
 
-기본 ``yolo26x.pt``는 항상 활성이고, 사용자가 올린 `.pt` 하나를 두 번째 lane으로
-허용한다. 임의 경로는 계속 차단하고, custom 원본 이름은 고정된
-``WEIGHTS_DIR/custom.pt`` 로만 해석한다.
-API 프로세스는 ultralytics를 import하지 않으며 클래스 추출은 짧은 subprocess에서 한다.
+레인은 ``anchor``(거리쌍 기준)와 ``target``(거리쌍 상대) 둘로 고정이다. 각 레인은
+``WEIGHTS_DIR/<lane>.pt`` + ``WEIGHTS_DIR/<lane>.json`` 슬롯 한 쌍을 갖고, 슬롯이
+비어 있으면 ``LANE_PRESET`` 의 preset 으로 떨어진다 — "preset 을 가리키는 상태"를
+따로 저장하지 않으므로 메타데이터와 실물이 어긋날 수 없다.
+
+worker 의 모델 식별자도 레인 id 다. 원본 파일명은 메타데이터의 ``original_name`` 에만
+남아 표시용으로 쓰이므로, 두 레인에 같은 이름(심지어 preset 과 같은 이름)을 올려도
+충돌하지 않는다.
+
+API 프로세스는 ultralytics 를 import 하지 않으며 클래스 추출은 짧은 subprocess 에서 한다.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -18,13 +25,21 @@ from typing import Any
 
 from app import config
 
-DEFAULT_MODEL = "yolo26x.pt"
-CUSTOM_FILENAME = "custom.pt"
-CUSTOM_METADATA_FILENAME = "custom.json"
+logger = logging.getLogger(__name__)
+
+# 레인 둘로 고정. 개수를 늘릴 계획이 없어 슬롯 파일 두 쌍이면 충분하다.
+LANES: tuple[str, ...] = ("anchor", "target")
+DEFAULT_LANE = "anchor"
+# 업로드가 없을 때의 fallback. target 은 preset 이 없어 업로드해야 활성이다.
+LANE_PRESET: dict[str, str | None] = {"anchor": "yolo26x.pt", "target": None}
+
+DEFAULT_MODEL = "yolo26x.pt"  # preset 카탈로그 기본값
+LEGACY_CUSTOM_WEIGHTS_FILENAME = "custom.pt"
+LEGACY_CUSTOM_METADATA_FILENAME = "custom.json"
 MAX_UPLOAD_BYTES = 600 * 1024 * 1024
 CLASS_EXTRACTION_TIMEOUT_SEC = 60
 
-# Preset 모델 — UI 토글 + worker 자동 다운로드 기본값. 신뢰경계: ultralytics 공식 가중치만.
+# Preset 모델 — 카탈로그 + worker 자동 다운로드 기본값. 신뢰경계: ultralytics 공식 가중치만.
 PRESET_MODELS: tuple[str, ...] = (
     "yolo26n.pt",
     "yolo26s.pt",
@@ -123,12 +138,49 @@ def _weights_dir() -> Path:
     return config.WEIGHTS_DIR
 
 
-def custom_weights_path() -> Path:
-    return _weights_dir() / CUSTOM_FILENAME
+def is_lane(name: str) -> bool:
+    """name 이 레인 id 인지 확인한다."""
+    return name in LANES
 
 
-def custom_metadata_path() -> Path:
-    return _weights_dir() / CUSTOM_METADATA_FILENAME
+def lane_weights_path(lane: str) -> Path:
+    return _weights_dir() / f"{lane}.pt"
+
+
+def lane_metadata_path(lane: str) -> Path:
+    return _weights_dir() / f"{lane}.json"
+
+
+def _legacy_custom_weights_path() -> Path:
+    return _weights_dir() / LEGACY_CUSTOM_WEIGHTS_FILENAME
+
+
+def _legacy_custom_metadata_path() -> Path:
+    return _weights_dir() / LEGACY_CUSTOM_METADATA_FILENAME
+
+
+def _migrate_legacy_target_slot() -> None:
+    """구 ``custom.pt``/``custom.json`` 을 target 슬롯으로 lazy rename 한다.
+
+    startup 훅이 아니라 조회 함수에서 부른다 — streaming.manager 싱글턴이 모듈 import
+    시점에 활성 레인을 읽으므로 startup 훅은 그보다 늦다. target 슬롯이 이미 차 있으면
+    레거시 파일을 건드리지 않는다(멱등). 실패해도 target 비활성으로 진행하고, 사용자는
+    재업로드로 회복한다.
+    """
+    target_weights = lane_weights_path("target")
+    legacy_weights = _legacy_custom_weights_path()
+    if target_weights.exists() or not legacy_weights.is_file():
+        return
+    legacy_metadata = _legacy_custom_metadata_path()
+    try:
+        # .json 을 먼저 옮긴다 — 중간에 죽어도 .pt 없는 반쪽 상태는 비활성으로 처리된다.
+        if legacy_metadata.is_file():
+            os.replace(legacy_metadata, lane_metadata_path("target"))
+        os.replace(legacy_weights, target_weights)
+    except OSError:
+        logger.warning(
+            "레거시 custom 가중치를 target 레인으로 이관하지 못했습니다", exc_info=True
+        )
 
 
 def _normalize_classes(value: Any) -> list[dict] | None:
@@ -146,10 +198,14 @@ def _normalize_classes(value: Any) -> list[dict] | None:
     return classes
 
 
-def get_custom_metadata() -> dict | None:
-    """두 영속 파일이 모두 유효할 때만 custom을 활성 상태로 본다."""
-    weights_path = custom_weights_path()
-    metadata_path = custom_metadata_path()
+def get_lane_metadata(lane: str) -> dict | None:
+    """업로드 슬롯 메타데이터. 두 영속 파일이 모두 유효할 때만 활성으로 본다."""
+    if not is_lane(lane):
+        return None
+    if lane == "target":
+        _migrate_legacy_target_slot()
+    weights_path = lane_weights_path(lane)
+    metadata_path = lane_metadata_path(lane)
     if not weights_path.is_file() or not metadata_path.is_file():
         return None
     try:
@@ -166,7 +222,6 @@ def get_custom_metadata() -> dict | None:
         not isinstance(original_name, str)
         or Path(original_name).name != original_name
         or Path(original_name).suffix.lower() != ".pt"
-        or original_name == DEFAULT_MODEL
         or not isinstance(uploaded_at, str)
         or not isinstance(size_bytes, int)
         or size_bytes < 0
@@ -181,61 +236,68 @@ def get_custom_metadata() -> dict | None:
     }
 
 
+def get_lane_status(lane: str) -> dict | None:
+    """레인 상태 1건. 업로드도 preset 도 없으면 None(비활성)."""
+    if not is_lane(lane):
+        return None
+    metadata = get_lane_metadata(lane)
+    if metadata is not None:
+        return {
+            "lane": lane,
+            "source": "upload",
+            "name": metadata["original_name"],
+            "uploaded_at": metadata["uploaded_at"],
+            "size_mb": metadata["size_bytes"] / 1024 / 1024,
+            "class_count": len(metadata["classes"]),
+        }
+    preset = LANE_PRESET.get(lane)
+    if preset is None:
+        return None
+    return {
+        "lane": lane,
+        "source": "preset",
+        "name": preset,
+        "uploaded_at": None,
+        "size_mb": None,
+        "class_count": len(COCO_CLASS_NAMES),
+    }
+
+
+def get_all_lane_status() -> dict[str, dict | None]:
+    return {lane: get_lane_status(lane) for lane in LANES}
+
+
+def get_active_lanes() -> list[str]:
+    """worker·source 요청에 쓸 활성 레인 id 목록."""
+    return [lane for lane in LANES if get_lane_status(lane) is not None]
+
+
+def list_lane_classes(lane: str) -> list[dict]:
+    """레인의 클래스 목록. preset 이면 정적 COCO 80종, 업로드면 메타데이터."""
+    if not is_lane(lane):
+        raise ValueError(f"알 수 없는 레인: {lane!r}")
+    metadata = get_lane_metadata(lane)
+    if metadata is not None:
+        return list(metadata["classes"])
+    preset = LANE_PRESET.get(lane)
+    if preset is None:
+        raise ValueError(f"{lane} 레인 가중치가 없습니다")
+    return list_model_classes(preset)
+
+
 def is_preset(name: str) -> bool:
     """name 이 허용된 공식 preset 인지 확인한다."""
     return name in PRESET_MODELS
 
 
 def is_allowed_model(name: str) -> bool:
-    """공식 preset 또는 현재 활성 custom 별칭만 worker 입력으로 허용한다."""
-    metadata = get_custom_metadata()
-    return is_preset(name) or (
-        metadata is not None and name == metadata["original_name"]
-    )
-
-
-def get_active_model_name() -> str:
-    """전역 기본 모델은 custom 유무와 무관하게 yolo26x로 고정한다."""
-    return DEFAULT_MODEL
-
-
-def get_active_model_names() -> list[str]:
-    """source 요청에 사용할 고정 preset + 선택적 custom lane 이름."""
-    metadata = get_custom_metadata()
-    return [
-        DEFAULT_MODEL,
-        *([str(metadata["original_name"])] if metadata is not None else []),
-    ]
-
-
-def get_active_weights_status() -> dict:
-    metadata = get_custom_metadata()
-    return {
-        "preset_name": DEFAULT_MODEL,
-        "custom": None
-        if metadata is None
-        else {
-            "name": metadata["original_name"],
-            "uploaded_at": metadata["uploaded_at"],
-            "size_mb": metadata["size_bytes"] / 1024 / 1024,
-            "class_count": len(metadata["classes"]),
-        },
-    }
+    """worker 입력으로 허용되는 것은 현재 활성 레인 id 뿐이다."""
+    return name in get_active_lanes()
 
 
 def list_all_models() -> list[dict]:
-    """공식 preset과, 존재하면 현재 custom 하나를 반환한다."""
-    models = [{"name": n, "type": "preset", "size_mb": None} for n in PRESET_MODELS]
-    metadata = get_custom_metadata()
-    if metadata is not None:
-        models.append(
-            {
-                "name": metadata["original_name"],
-                "type": "custom",
-                "size_mb": metadata["size_bytes"] / 1024 / 1024,
-            }
-        )
-    return models
+    """공식 preset 카탈로그. 레인 개념과 독립이다."""
+    return [{"name": n, "type": "preset", "size_mb": None} for n in PRESET_MODELS]
 
 
 def list_model_classes(name: str) -> list[dict]:
@@ -248,15 +310,8 @@ def list_model_classes(name: str) -> list[dict]:
     ]
 
 
-def list_active_classes() -> list[dict]:
-    metadata = get_custom_metadata()
-    if metadata is None:
-        raise ValueError("custom 가중치가 없습니다")
-    return list(metadata["classes"])
-
-
 def extract_model_classes(path: Path) -> list[dict]:
-    """custom 모델 names를 격리 subprocess에서 읽는다."""
+    """업로드 모델 names를 격리 subprocess에서 읽는다."""
     script = """
 import json
 import sys
@@ -289,14 +344,17 @@ print(json.dumps([{"id": int(class_id), "name": str(name)} for class_id, name in
     return classes
 
 
-def activate_custom_weights(
+def activate_lane_weights(
     temporary_path: Path,
     *,
+    lane: str,
     original_name: str,
     size_bytes: int,
     classes: list[dict],
 ) -> dict:
-    """검증된 임시파일을 고정 custom 경로로 원자 교체하고 메타데이터를 기록한다."""
+    """검증된 임시파일을 레인 슬롯으로 원자 교체하고 메타데이터를 기록한다."""
+    if not is_lane(lane):
+        raise ValueError(f"알 수 없는 레인: {lane!r}")
     directory = _weights_dir()
     directory.mkdir(parents=True, exist_ok=True)
     uploaded_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -306,26 +364,30 @@ def activate_custom_weights(
         "size_bytes": int(size_bytes),
         "classes": classes,
     }
-    metadata_tmp = directory / ".custom.json.tmp"
+    metadata_tmp = directory / f".{lane}.json.tmp"
     metadata_tmp.write_text(
         json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
         encoding="utf-8",
     )
-    os.replace(temporary_path, custom_weights_path())
-    os.replace(metadata_tmp, custom_metadata_path())
+    os.replace(temporary_path, lane_weights_path(lane))
+    os.replace(metadata_tmp, lane_metadata_path(lane))
     return metadata
 
 
-def delete_custom_weights() -> None:
-    custom_weights_path().unlink(missing_ok=True)
-    custom_metadata_path().unlink(missing_ok=True)
+def delete_lane_weights(lane: str) -> None:
+    """업로드 슬롯을 비운다. preset 이 있는 레인은 preset 으로 복귀한다."""
+    if not is_lane(lane):
+        raise ValueError(f"알 수 없는 레인: {lane!r}")
+    lane_weights_path(lane).unlink(missing_ok=True)
+    lane_metadata_path(lane).unlink(missing_ok=True)
 
 
 def resolve_model_path(name: str) -> str:
-    """worker 모델 이름을 preset 이름 또는 고정 custom 파일 하나로 해석한다."""
-    metadata = get_custom_metadata()
-    if metadata is not None and name == metadata["original_name"]:
-        return str(custom_weights_path())
-    if is_preset(name):
-        return name
+    """worker 모델 이름(레인 id)을 슬롯 파일 경로 또는 preset 이름으로 해석한다."""
+    if is_lane(name):
+        if get_lane_metadata(name) is not None:
+            return str(lane_weights_path(name))
+        preset = LANE_PRESET.get(name)
+        if preset is not None:
+            return preset
     raise ValueError(f"허용되지 않은 모델: {name!r}")

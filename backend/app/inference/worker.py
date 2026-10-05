@@ -20,7 +20,7 @@ from typing import Optional
 import numpy as np
 
 from app import config
-from app.inference.models_dir import get_active_model_name, is_allowed_model
+from app.inference.models_dir import DEFAULT_LANE, is_allowed_model
 
 logger = logging.getLogger(__name__)
 
@@ -263,7 +263,7 @@ class InferenceWorker:
         conf_threshold: Optional[float] = None,
         device: Optional[str] = None,
     ) -> None:
-        self.model_name = model_name or get_active_model_name()
+        self.model_name = model_name or DEFAULT_LANE
         self.conf_threshold = float(
             conf_threshold if conf_threshold is not None else config.YOLO_CONF_THRESHOLD
         )
@@ -588,7 +588,7 @@ class InferenceWorker:
         )
 
     def reload_model(self, model_name: str) -> None:
-        """같은 alias의 custom 파일 내용이 교체됐을 때 해당 lane만 재생성한다."""
+        """같은 레인의 가중치 파일 내용이 교체됐을 때 해당 lane만 재생성한다."""
         if not is_allowed_model(model_name):
             raise ValueError(f"허용되지 않은 모델: {model_name}")
         with self._pool_lock:

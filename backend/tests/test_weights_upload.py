@@ -1,20 +1,29 @@
-"""시스템 전역 YOLO 가중치 업로드 계약."""
+"""레인 가중치 API 계약 (/api/inference/weights, /api/inference/lanes/*)."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.testclient import TestClient
 
 from app import config, inference_api
 from app.inference import models_dir
-from app.inference.worker import Detection, InferenceResult, InferenceWorker
-from app.streaming.manager import StreamManager, detections_to_json
+
+PRESET_ANCHOR = {
+    "lane": "anchor",
+    "source": "preset",
+    "name": "yolo26x.pt",
+    "uploaded_at": None,
+    "size_mb": None,
+    "class_count": 80,
+}
 
 
 @pytest.fixture()
@@ -53,138 +62,163 @@ def client(
     return TestClient(app), set_model, set_all_sources, reload_model
 
 
-def test_default_weights_status_uses_fixed_yolo26x_and_has_no_custom_classes(
-    weights_dir: Path,
+def _upload(http: TestClient, lane: str, filename: str, payload: bytes = b"model-bytes"):
+    return http.post(
+        f"/api/inference/lanes/{lane}/weights",
+        files={"file": (filename, payload, "application/octet-stream")},
+    )
+
+
+def test_default_status_reports_preset_anchor_and_inactive_target(
+    client: tuple[TestClient, MagicMock, MagicMock, MagicMock],
 ) -> None:
-    status = models_dir.get_active_weights_status()
+    http, _set_model, _set_all_sources, _reload_model = client
 
-    assert status == {
-        "preset_name": "yolo26x.pt",
-        "custom": None,
-    }
-    assert models_dir.get_active_model_name() == "yolo26x.pt"
-    assert models_dir.get_active_model_names() == ["yolo26x.pt"]
-    with pytest.raises(ValueError, match="custom"):
-        models_dir.list_active_classes()
+    response = http.get("/api/inference/weights")
+
+    assert response.status_code == 200
+    assert response.json() == {"lanes": {"anchor": PRESET_ANCHOR, "target": None}}
+    assert http.get("/api/inference/lanes/target/classes").status_code == 404
 
 
-def test_upload_persists_custom_weights_and_activates_dual_source_models(
+def test_target_upload_persists_slot_and_activates_both_lanes(
     client: tuple[TestClient, MagicMock, MagicMock, MagicMock],
     weights_dir: Path,
 ) -> None:
     http, set_model, set_all_sources, reload_model = client
 
-    response = http.post(
-        "/api/inference/weights",
-        files={"file": ("warehouse-v3.pt", b"model-bytes", "application/octet-stream")},
-    )
+    response = _upload(http, "target", "warehouse-v3.pt")
 
     assert response.status_code == 200
     body = response.json()
-    assert body["preset_name"] == "yolo26x.pt"
-    assert body["custom"]["name"] == "warehouse-v3.pt"
-    assert body["custom"]["class_count"] == 2
-    assert body["custom"]["size_mb"] == pytest.approx(
-        len(b"model-bytes") / 1024 / 1024
-    )
-    assert body["custom"]["uploaded_at"].endswith("Z")
-    assert (weights_dir / "custom.pt").read_bytes() == b"model-bytes"
-    metadata = json.loads((weights_dir / "custom.json").read_text(encoding="utf-8"))
-    assert metadata == {
+    assert body["lanes"]["anchor"] == PRESET_ANCHOR
+    target = body["lanes"]["target"]
+    assert target["source"] == "upload"
+    assert target["name"] == "warehouse-v3.pt"
+    assert target["class_count"] == 2
+    assert target["size_mb"] == pytest.approx(len(b"model-bytes") / 1024 / 1024)
+    assert target["uploaded_at"].endswith("Z")
+    assert (weights_dir / "target.pt").read_bytes() == b"model-bytes"
+    assert json.loads((weights_dir / "target.json").read_text(encoding="utf-8")) == {
         "original_name": "warehouse-v3.pt",
-        "uploaded_at": body["custom"]["uploaded_at"],
+        "uploaded_at": target["uploaded_at"],
         "size_bytes": len(b"model-bytes"),
         "classes": [{"id": 0, "name": "forklift"}, {"id": 4, "name": "pallet"}],
     }
     set_model.assert_not_called()
-    set_all_sources.assert_called_once_with(["yolo26x.pt", "warehouse-v3.pt"])
-    reload_model.assert_called_once_with("warehouse-v3.pt")
-
+    reload_model.assert_called_once_with("target")
+    set_all_sources.assert_called_once_with(["anchor", "target"])
     assert http.get("/api/inference/weights").json() == body
-    assert http.get("/api/inference/classes").json() == metadata["classes"]
-    assert models_dir.get_active_model_name() == "yolo26x.pt"
-    assert models_dir.get_active_model_names() == ["yolo26x.pt", "warehouse-v3.pt"]
-    assert models_dir.resolve_model_path("warehouse-v3.pt") == str(weights_dir / "custom.pt")
-    assert http.put(
-        "/api/inference/config",
-        json={"model": "yolo26n.pt"},
-    ).status_code == 400
-    assert http.put(
-        "/api/inference/config",
-        json={"model": "warehouse-v3.pt"},
-    ).status_code == 400
+    assert http.get("/api/inference/lanes/target/classes").json() == [
+        {"id": 0, "name": "forklift"},
+        {"id": 4, "name": "pallet"},
+    ]
 
 
-def test_non_default_preset_filename_can_be_uploaded_as_custom_weights(
+def test_anchor_upload_replaces_preset_without_renaming_the_lane(
     client: tuple[TestClient, MagicMock, MagicMock, MagicMock],
     weights_dir: Path,
 ) -> None:
     http, _set_model, set_all_sources, reload_model = client
 
-    response = http.post(
-        "/api/inference/weights",
-        files={"file": ("yolo26n.pt", b"custom-nano", "application/octet-stream")},
-    )
+    response = _upload(http, "anchor", "site.pt", b"anchor-bytes")
 
     assert response.status_code == 200
-    assert response.json()["custom"]["name"] == "yolo26n.pt"
-    assert models_dir.get_active_model_names() == ["yolo26x.pt", "yolo26n.pt"]
-    assert models_dir.resolve_model_path("yolo26n.pt") == str(weights_dir / "custom.pt")
-    set_all_sources.assert_called_once_with(["yolo26x.pt", "yolo26n.pt"])
-    reload_model.assert_called_once_with("yolo26n.pt")
+    anchor = response.json()["lanes"]["anchor"]
+    assert anchor["source"] == "upload"
+    assert anchor["name"] == "site.pt"
+    assert (weights_dir / "anchor.pt").read_bytes() == b"anchor-bytes"
+    reload_model.assert_called_once_with("anchor")
+    set_all_sources.assert_called_once_with(["anchor"])
+    assert http.get("/api/inference/lanes/anchor/classes").json() == [
+        {"id": 0, "name": "forklift"},
+        {"id": 4, "name": "pallet"},
+    ]
 
 
-def test_delete_custom_weights_keeps_preset_and_removes_custom_lane(
+def test_both_lanes_accept_the_same_filename_and_preset_names(
     client: tuple[TestClient, MagicMock, MagicMock, MagicMock],
     weights_dir: Path,
 ) -> None:
-    http, set_model, set_all_sources, reload_model = client
-    assert http.post(
-        "/api/inference/weights",
-        files={"file": ("custom-model.pt", b"weights", "application/octet-stream")},
-    ).status_code == 200
-    set_model.reset_mock()
+    http, _set_model, _set_all_sources, _reload_model = client
+
+    assert _upload(http, "anchor", "best.pt", b"anchor-best").status_code == 200
+    response = _upload(http, "target", "best.pt", b"target-best")
+
+    assert response.status_code == 200
+    lanes = response.json()["lanes"]
+    assert lanes["anchor"]["name"] == "best.pt"
+    assert lanes["target"]["name"] == "best.pt"
+    assert (weights_dir / "anchor.pt").read_bytes() == b"anchor-best"
+    assert (weights_dir / "target.pt").read_bytes() == b"target-best"
+    assert _upload(http, "target", "yolo26x.pt", b"preset-name").status_code == 200
+    assert http.get("/api/inference/weights").json()["lanes"]["target"]["name"] == "yolo26x.pt"
+
+
+def test_unknown_lane_is_rejected_on_every_lane_endpoint(
+    client: tuple[TestClient, MagicMock, MagicMock, MagicMock],
+) -> None:
+    http, _set_model, set_all_sources, reload_model = client
+
+    assert http.get("/api/inference/lanes/custom/classes").status_code == 404
+    assert _upload(http, "custom", "x.pt").status_code == 404
+    assert http.delete("/api/inference/lanes/custom/weights").status_code == 404
+    set_all_sources.assert_not_called()
+    reload_model.assert_not_called()
+
+
+def test_target_delete_deactivates_the_lane_without_reload(
+    client: tuple[TestClient, MagicMock, MagicMock, MagicMock],
+    weights_dir: Path,
+) -> None:
+    http, _set_model, set_all_sources, reload_model = client
+    assert _upload(http, "target", "warehouse.pt").status_code == 200
     set_all_sources.reset_mock()
     reload_model.reset_mock()
 
-    response = http.delete("/api/inference/weights")
+    response = http.delete("/api/inference/lanes/target/weights")
 
     assert response.status_code == 200
-    assert response.json() == {"preset_name": "yolo26x.pt", "custom": None}
-    assert not (weights_dir / "custom.pt").exists()
-    assert not (weights_dir / "custom.json").exists()
-    set_model.assert_not_called()
-    set_all_sources.assert_called_once_with(["yolo26x.pt"])
+    assert response.json() == {"lanes": {"anchor": PRESET_ANCHOR, "target": None}}
+    assert not (weights_dir / "target.pt").exists()
+    assert not (weights_dir / "target.json").exists()
+    set_all_sources.assert_called_once_with(["anchor"])
     reload_model.assert_not_called()
-    assert http.get("/api/inference/classes").status_code == 404
+    assert http.get("/api/inference/lanes/target/classes").status_code == 404
 
 
-def test_invalid_extension_and_oversized_upload_leave_no_files(
+def test_anchor_delete_returns_to_preset_and_reloads_the_surviving_lane(
+    client: tuple[TestClient, MagicMock, MagicMock, MagicMock],
+    weights_dir: Path,
+) -> None:
+    http, _set_model, set_all_sources, reload_model = client
+    assert _upload(http, "anchor", "site.pt").status_code == 200
+    set_all_sources.reset_mock()
+    reload_model.reset_mock()
+
+    response = http.delete("/api/inference/lanes/anchor/weights")
+
+    assert response.status_code == 200
+    assert response.json()["lanes"]["anchor"] == PRESET_ANCHOR
+    assert not (weights_dir / "anchor.pt").exists()
+    reload_model.assert_called_once_with("anchor")
+    set_all_sources.assert_called_once_with(["anchor"])
+    assert len(http.get("/api/inference/lanes/anchor/classes").json()) == 80
+
+
+def test_invalid_extension_empty_and_oversized_uploads_leave_no_files(
     client: tuple[TestClient, MagicMock, MagicMock, MagicMock],
     weights_dir: Path,
     monkeypatch,
 ) -> None:
     http, set_model, set_all_sources, reload_model = client
 
-    response = http.post(
-        "/api/inference/weights",
-        files={"file": ("weights.onnx", b"not-pt", "application/octet-stream")},
-    )
-    assert response.status_code == 400
-
-    response = http.post(
-        "/api/inference/weights",
-        files={"file": ("yolo26x.pt", b"alias-collision", "application/octet-stream")},
-    )
-    assert response.status_code == 400
-    assert "고정 person 모델 yolo26x.pt" in response.json()["detail"]
+    assert _upload(http, "target", "weights.onnx", b"not-pt").status_code == 400
+    assert _upload(http, "target", "empty.pt", b"").status_code == 400
 
     monkeypatch.setattr(models_dir, "MAX_UPLOAD_BYTES", 3)
-    response = http.post(
-        "/api/inference/weights",
-        files={"file": ("too-large.pt", b"1234", "application/octet-stream")},
-    )
-    assert response.status_code == 400
+    assert _upload(http, "target", "too-large.pt", b"1234").status_code == 400
+
     assert list(weights_dir.iterdir()) == []
     set_model.assert_not_called()
     set_all_sources.assert_not_called()
@@ -202,10 +236,8 @@ def test_class_extraction_failure_removes_temporary_upload(
         raise ValueError("not a detection model")
 
     monkeypatch.setattr(models_dir, "extract_model_classes", fail_extract)
-    response = http.post(
-        "/api/inference/weights",
-        files={"file": ("broken.pt", b"bad", "application/octet-stream")},
-    )
+
+    response = _upload(http, "anchor", "broken.pt", b"bad")
 
     assert response.status_code == 400
     assert list(weights_dir.iterdir()) == []
@@ -214,7 +246,56 @@ def test_class_extraction_failure_removes_temporary_upload(
     reload_model.assert_not_called()
 
 
-def test_extract_model_classes_runs_ultralytics_in_short_subprocess(monkeypatch, tmp_path: Path) -> None:
+def test_inference_config_model_accepts_active_lane_ids_only(
+    client: tuple[TestClient, MagicMock, MagicMock, MagicMock],
+) -> None:
+    http, set_model, _set_all_sources, _reload_model = client
+
+    assert http.patch("/api/inference", json={"model": "anchor"}).status_code == 404
+    assert http.put("/api/inference/config", json={"model": "yolo26x.pt"}).status_code == 400
+    assert http.put("/api/inference/config", json={"model": "target"}).status_code == 400
+    set_model.assert_not_called()
+
+    assert http.put("/api/inference/config", json={"model": "anchor"}).status_code == 200
+    set_model.assert_called_once_with("anchor")
+
+    assert _upload(http, "target", "warehouse.pt").status_code == 200
+    assert http.put("/api/inference/config", json={"model": "target"}).status_code == 200
+
+
+@pytest.mark.parametrize("rejected_model", ["target", "yolo26x.pt", "unknown"])
+def test_rejected_model_does_not_change_inference_state(
+    client: tuple[TestClient, MagicMock, MagicMock, MagicMock],
+    monkeypatch,
+    rejected_model: str,
+) -> None:
+    http, set_model, _set_all_sources, _reload_model = client
+    set_enabled = MagicMock()
+    monkeypatch.setattr(inference_api.stream_manager, "set_inference_enabled", set_enabled)
+
+    response = http.put(
+        "/api/inference/config", json={"enabled": False, "model": rejected_model}
+    )
+
+    assert response.status_code == 400
+    set_enabled.assert_not_called()
+    set_model.assert_not_called()
+
+
+def test_invalid_extension_closes_the_upload_before_raising(weights_dir: Path) -> None:
+    upload = UploadFile(filename="weights.onnx", file=BytesIO(b"not-pt"))
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(inference_api.upload_lane_weights("target", upload))
+
+    assert exc.value.status_code == 400
+    assert upload.file.closed
+    assert list(weights_dir.iterdir()) == []
+
+
+def test_extract_model_classes_runs_ultralytics_in_short_subprocess(
+    monkeypatch, tmp_path: Path
+) -> None:
     weight_path = tmp_path / "candidate.pt"
     weight_path.write_bytes(b"weights")
     completed = subprocess.CompletedProcess(
@@ -231,130 +312,3 @@ def test_extract_model_classes_runs_ultralytics_in_short_subprocess(monkeypatch,
     assert command[-1] == str(weight_path)
     assert "ultralytics" in command[2]
     assert run.call_args.kwargs["timeout"] <= 60
-
-
-def test_only_presets_and_the_active_custom_alias_can_resolve(weights_dir: Path) -> None:
-    (weights_dir / "custom.pt").write_bytes(b"weights")
-    (weights_dir / "custom.json").write_text(
-        json.dumps(
-            {
-                "original_name": "site-model.pt",
-                "uploaded_at": "2026-08-18T00:00:00Z",
-                "size_bytes": 7,
-                "classes": [{"id": 0, "name": "person"}],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    assert models_dir.is_preset("yolo26n.pt")
-    assert not models_dir.is_preset("site-model.pt")
-    assert models_dir.is_allowed_model("site-model.pt")
-    assert models_dir.resolve_model_path("site-model.pt") == str(weights_dir / "custom.pt")
-    assert models_dir.resolve_model_path("yolo26n.pt") == "yolo26n.pt"
-    for rejected in ("custom.pt", "/tmp/site-model.pt", "../site-model.pt", "other.pt"):
-        assert not models_dir.is_allowed_model(rejected)
-        with pytest.raises(ValueError):
-            models_dir.resolve_model_path(rejected)
-
-
-def test_existing_custom_metadata_restores_active_model_after_restart(weights_dir: Path) -> None:
-    (weights_dir / "custom.pt").write_bytes(b"weights")
-    (weights_dir / "custom.json").write_text(
-        json.dumps(
-            {
-                "original_name": "persisted.pt",
-                "uploaded_at": "2026-08-18T01:02:03Z",
-                "size_bytes": 7,
-                "classes": [{"id": 0, "name": "worker"}],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    assert models_dir.get_active_model_name() == "yolo26x.pt"
-    assert models_dir.get_active_model_names() == ["yolo26x.pt", "persisted.pt"]
-    assert models_dir.get_active_weights_status()["custom"]["name"] == "persisted.pt"
-    assert models_dir.list_active_classes() == [{"id": 0, "name": "worker"}]
-
-    worker = InferenceWorker()
-    assert worker.get_status()["model"] == "yolo26x.pt"
-    worker.configure_models({"yolo26x.pt", "persisted.pt", "../escape.pt"})
-    assert worker.get_pool_status()["models"] == ["persisted.pt", "yolo26x.pt"]
-
-    manager = StreamManager()
-    assert manager.get_source_models("ipcam-after-restart") == [
-        "yolo26x.pt",
-        "persisted.pt",
-    ]
-
-
-def test_reload_model_replaces_same_named_custom_worker_lane(weights_dir: Path) -> None:
-    (weights_dir / "custom.pt").write_bytes(b"weights")
-    (weights_dir / "custom.json").write_text(
-        json.dumps(
-            {
-                "original_name": "site-model.pt",
-                "uploaded_at": "2026-08-18T01:02:03Z",
-                "size_bytes": 7,
-                "classes": [{"id": 0, "name": "forklift"}],
-            }
-        ),
-        encoding="utf-8",
-    )
-    worker = InferenceWorker(model_name="yolo26x.pt")
-
-    class ExistingLane:
-        stopped = False
-
-        def stop(self) -> None:
-            self.stopped = True
-
-    existing = ExistingLane()
-    worker._desired_models = {"yolo26x.pt", "site-model.pt"}
-    worker._lanes["site-model.pt"] = existing  # type: ignore[assignment]
-    worker.reload_model("site-model.pt")
-
-    assert existing.stopped
-    assert worker._lanes.get("site-model.pt") is not existing
-    assert worker.get_pool_status()["models"] == ["site-model.pt", "yolo26x.pt"]
-
-
-def test_all_source_models_recalculate_to_the_dual_active_set(weights_dir: Path) -> None:
-    manager = StreamManager()
-    manager._per_source_models = {
-        "ipcam-a": ["yolo26n.pt"],
-        "ipcam-b": [],
-    }
-    manager._recompute_cadence = MagicMock()  # type: ignore[method-assign]
-
-    manager.set_all_source_models(["yolo26x.pt", "active.pt"])
-
-    assert manager._per_source_models == {
-        "ipcam-a": ["yolo26x.pt", "active.pt"],
-        "ipcam-b": ["yolo26x.pt", "active.pt"],
-    }
-    assert manager._default_source_models == ["yolo26x.pt", "active.pt"]
-    manager._recompute_cadence.assert_called_once()
-
-
-def test_detection_payload_preserves_each_lane_model_name() -> None:
-    payload = json.loads(
-        detections_to_json(
-            InferenceResult(
-                source_id="ipcam-a",
-                timestamp=1.0,
-                frame_w=640,
-                frame_h=360,
-                detections=[
-                    Detection(0, "person", 0.9, (0, 0, 10, 20), "yolo26x.pt"),
-                    Detection(0, "forklift", 0.8, (20, 0, 40, 20), "warehouse.pt"),
-                ],
-            )
-        )
-    )
-
-    assert [item["model"] for item in payload["items"]] == [
-        "yolo26x.pt",
-        "warehouse.pt",
-    ]

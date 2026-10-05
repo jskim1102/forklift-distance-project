@@ -115,7 +115,7 @@ def test_delete_missing_returns_404(client):
     assert resp.status_code == 404
 
 
-def test_per_camera_inference_requires_exact_preset_and_custom_pair(
+def test_per_camera_inference_requires_both_active_lanes(
     client,
     monkeypatch,
     tmp_path,
@@ -123,8 +123,8 @@ def test_per_camera_inference_requires_exact_preset_and_custom_pair(
     from app import config
 
     monkeypatch.setattr(config, "WEIGHTS_DIR", tmp_path)
-    (tmp_path / "custom.pt").write_bytes(b"weights")
-    (tmp_path / "custom.json").write_text(
+    (tmp_path / "target.pt").write_bytes(b"weights")
+    (tmp_path / "target.json").write_text(
         json.dumps(
             {
                 "original_name": "warehouse.pt",
@@ -143,32 +143,68 @@ def test_per_camera_inference_requires_exact_preset_and_custom_pair(
 
     response = client.put(
         f"/api/ipcams/{key}/inference",
-        json={"enabled": True, "models": ["yolo26x.pt"]},
+        json={"enabled": True, "models": ["anchor"]},
     )
     assert response.status_code == 400
+    assert response.json()["detail"] == "models는 활성 레인 anchor·target 두 개여야 합니다"
 
     response = client.put(
         f"/api/ipcams/{key}/inference",
-        json={"enabled": True, "models": ["yolo26x.pt", "warehouse.pt"]},
+        json={"enabled": True, "models": ["anchor", "target"]},
     )
     assert response.status_code == 200
     assert response.json()["enabled"] is True
-    assert response.json()["models"] == ["yolo26x.pt", "warehouse.pt"]
+    assert response.json()["models"] == ["anchor", "target"]
 
     response = client.put(f"/api/ipcams/{key}/inference", json={"enabled": False})
     assert response.status_code == 200
     assert response.json()["enabled"] is False
 
 
+def test_per_camera_inference_rejects_enable_with_stale_stored_models(
+    client,
+    monkeypatch,
+    tmp_path,
+):
+    """models 를 생략한 enable 은 저장된 per-source 목록으로 판정한다."""
+    from app import config
+    from app.streaming.manager import manager as stream_manager
+
+    monkeypatch.setattr(config, "WEIGHTS_DIR", tmp_path)
+    (tmp_path / "target.pt").write_bytes(b"weights")
+    (tmp_path / "target.json").write_text(
+        json.dumps(
+            {
+                "original_name": "warehouse.pt",
+                "uploaded_at": "2026-08-18T00:00:00Z",
+                "size_bytes": 7,
+                "classes": [{"id": 0, "name": "forklift"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    cam = client.post(
+        "/api/ipcams",
+        json={"name": "measure", "rtsp_url": "rtsp://x/stale"},
+    ).json()
+    key = cam["stream_key"]
+    stream_manager.set_source_models(f"ipcam-{key}", ["anchor"])
+
+    response = client.put(f"/api/ipcams/{key}/inference", json={"enabled": True})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "자동 측정에는 활성 레인 anchor·target 두 개 모두 필요"
+
+
 def test_per_camera_inference_rejects_unknown_stream_key(client):
     response = client.put(
         "/api/ipcams/not-registered/inference",
-        json={"enabled": True, "models": ["yolo26x.pt", "warehouse.pt"]},
+        json={"enabled": True, "models": ["anchor", "target"]},
     )
     assert response.status_code == 404
 
 
-def test_per_camera_inference_cannot_enable_without_custom_weights(
+def test_per_camera_inference_cannot_enable_without_the_target_lane(
     client,
     monkeypatch,
     tmp_path,
@@ -178,16 +214,32 @@ def test_per_camera_inference_cannot_enable_without_custom_weights(
     monkeypatch.setattr(config, "WEIGHTS_DIR", tmp_path)
     cam = client.post(
         "/api/ipcams",
-        json={"name": "measure", "rtsp_url": "rtsp://x/no-custom"},
+        json={"name": "measure", "rtsp_url": "rtsp://x/no-target"},
     ).json()
+    key = cam["stream_key"]
+
+    # 진짜 원인은 "상대 레인 미업로드"다 — 보낸 그대로 보내라는 문구가 나가면 안 된다.
+    response = client.put(
+        f"/api/ipcams/{key}/inference",
+        json={"enabled": True, "models": ["anchor", "target"]},
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "자동 측정에는 상대 레인 가중치 업로드 필요"
 
     response = client.put(
-        f"/api/ipcams/{cam['stream_key']}/inference",
-        json={"enabled": True, "models": ["yolo26x.pt", "missing.pt"]},
+        f"/api/ipcams/{key}/inference",
+        json={"enabled": True, "models": ["anchor"]},
     )
-
     assert response.status_code == 400
-    assert "custom" in response.json()["detail"]
+    assert response.json()["detail"] == "자동 측정에는 상대 레인 가중치 업로드 필요"
+
+    # 끄는 요청은 레인 목록 모양만 본다.
+    response = client.put(
+        f"/api/ipcams/{key}/inference",
+        json={"enabled": False, "models": ["anchor", "target"]},
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "models는 활성 레인 anchor·target 두 개여야 합니다"
 
 
 # ─── net-new: mediamtx 사이드이펙트 배선 (test-first) ───

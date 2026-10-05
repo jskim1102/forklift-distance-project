@@ -1,19 +1,26 @@
-import { useEffect, useMemo, useState } from "react";
-import type { SelectedYoloClass, WeightsStatus, YoloClass } from "../types/detection";
+import { useEffect, useState } from "react";
+import type {
+  LaneStatus,
+  SelectedYoloClass,
+  WeightsStatus,
+  YoloClass,
+} from "../types/detection";
 import {
+  ANCHOR_LANE,
   canApplyMeasurementSettings,
   DEFAULT_CLASS_CONFIDENCE,
-  MAX_CLASS_CONFIDENCE,
-  MIN_CLASS_CONFIDENCE,
   normalizeClassConfidence,
-  PERSON_CLASS,
+  TARGET_LANE,
 } from "../utils/detectionPairs";
+import MeasurementLaneCard from "./MeasurementLaneCard";
 import Modal from "./Modal";
+
+export type LaneClasses = Record<string, YoloClass[]>;
 
 interface Props {
   open: boolean;
   cameraName: string;
-  classes: YoloClass[];
+  laneClasses: LaneClasses;
   initialEnabled: boolean;
   initialSelection: SelectedYoloClass[];
   canEnable: boolean;
@@ -24,19 +31,50 @@ interface Props {
   selectionResetToken: number;
   onClose: () => void;
   onConfirm: (enabled: boolean, classes: SelectedYoloClass[]) => void;
-  onUploadWeights: (file: File) => void;
-  onResetWeights: () => void;
+  onUploadWeights: (lane: string, file: File) => void;
+  onResetWeights: (lane: string) => void;
 }
 
-export function filterSelectableCustomClasses(classes: readonly YoloClass[]): YoloClass[] {
-  const fixedPersonName = PERSON_CLASS.name.trim().toLowerCase();
-  return classes.filter((item) => item.name.trim().toLowerCase() !== fixedPersonName);
+const LANE_LABEL: Record<string, string> = {
+  [ANCHOR_LANE]: "기준",
+  [TARGET_LANE]: "상대",
+};
+
+// 매 렌더 새 배열이 만들어지면 아래 useEffect 의존성이 매번 바뀐다. 모듈 상수로 고정한다.
+const NO_CLASSES: YoloClass[] = [];
+
+/** 저장 선택 하나가 그 레인에 아직 유효한지 — id 와 이름이 모두 같아야 한다. */
+function matchesLaneClass(
+  item: SelectedYoloClass,
+  lane: string,
+  classes: readonly YoloClass[],
+): boolean {
+  return (
+    item.model === lane
+    && classes.some((candidate) => candidate.id === item.id && candidate.name === item.name)
+  );
+}
+
+/**
+ * 레인의 기본 선택 클래스.
+ *
+ * 기준 레인은 person 이 있으면 그것을 고른다(preset 이면 COCO id 0). person 이 없는
+ * 업로드 가중치와 상대 레인은 기본 선택이 없다 — 사용자가 반드시 고른다.
+ */
+export function pickDefaultClass(
+  lane: string,
+  status: LaneStatus | null,
+  classes: readonly YoloClass[],
+): number | null {
+  if (lane !== ANCHOR_LANE || status == null) return null;
+  const person = classes.find((item) => item.name.trim().toLowerCase() === "person");
+  return person ? person.id : null;
 }
 
 export default function MeasurementClassModal({
   open,
   cameraName,
-  classes,
+  laneClasses,
   initialEnabled,
   initialSelection,
   canEnable,
@@ -50,154 +88,139 @@ export default function MeasurementClassModal({
   onUploadWeights,
   onResetWeights,
 }: Props) {
-  const [query, setQuery] = useState("");
   const [enabled, setEnabled] = useState(false);
-  const [selectedCustomId, setSelectedCustomId] = useState<number | null>(null);
-  const [personConfidence, setPersonConfidence] = useState(DEFAULT_CLASS_CONFIDENCE);
-  const [customConfidence, setCustomConfidence] = useState(DEFAULT_CLASS_CONFIDENCE);
-  const [weightFile, setWeightFile] = useState<File | null>(null);
+  const [anchorId, setAnchorId] = useState<number | null>(null);
+  const [targetId, setTargetId] = useState<number | null>(null);
+  const [anchorConfidence, setAnchorConfidence] = useState(DEFAULT_CLASS_CONFIDENCE);
+  const [targetConfidence, setTargetConfidence] = useState(DEFAULT_CLASS_CONFIDENCE);
 
-  const customName = weights?.custom?.name ?? null;
-  const customWeightsAvailable = customName != null;
-  const customClasses = useMemo(() => filterSelectableCustomClasses(classes), [classes]);
+  const anchorStatus = weights?.lanes.anchor ?? null;
+  const targetStatus = weights?.lanes.target ?? null;
+  const anchorClasses = laneClasses[ANCHOR_LANE] ?? NO_CLASSES;
+  const targetClasses = laneClasses[TARGET_LANE] ?? NO_CLASSES;
+  const targetAvailable = targetStatus != null;
 
   useEffect(() => {
     if (!open) return;
-    const initialPerson = initialSelection.find(
-      (item) => item.model === PERSON_CLASS.model && item.id === PERSON_CLASS.id,
+    const storedAnchor = initialSelection.find(
+      (item) => matchesLaneClass(item, ANCHOR_LANE, anchorClasses),
     );
-    const initialCustom = initialSelection.find(
-      (item) => item.model === customName && customClasses.some((candidate) => candidate.id === item.id),
+    const storedTarget = initialSelection.find(
+      (item) => matchesLaneClass(item, TARGET_LANE, targetClasses),
     );
-    setQuery("");
-    setEnabled(initialEnabled && customWeightsAvailable);
-    setSelectedCustomId(
-      initialCustom
-        ? initialCustom.id
-        : null,
+    setEnabled(initialEnabled && targetAvailable);
+    setAnchorId(
+      storedAnchor ? storedAnchor.id : pickDefaultClass(ANCHOR_LANE, anchorStatus, anchorClasses),
     );
-    setPersonConfidence(normalizeClassConfidence(initialPerson?.conf));
-    setCustomConfidence(normalizeClassConfidence(initialCustom?.conf));
-    setWeightFile(null);
+    setTargetId(
+      storedTarget ? storedTarget.id : pickDefaultClass(TARGET_LANE, targetStatus, targetClasses),
+    );
+    setAnchorConfidence(normalizeClassConfidence(storedAnchor?.conf));
+    setTargetConfidence(normalizeClassConfidence(storedTarget?.conf));
   }, [
-    customClasses,
-    customName,
-    customWeightsAvailable,
+    anchorClasses,
+    anchorStatus,
     initialEnabled,
     initialSelection,
     open,
     selectionResetToken,
+    targetAvailable,
+    targetClasses,
+    targetStatus,
   ]);
 
   const locked = saving || weightsBusy;
-  const visible = useMemo(() => {
-    const needle = query.trim().toLowerCase();
-    return needle
-      ? customClasses.filter((item) => item.name.toLowerCase().includes(needle))
-      : customClasses;
-  }, [customClasses, query]);
-  const selectedCustom = customClasses.find((item) => item.id === selectedCustomId) ?? null;
-  const selectedClasses: SelectedYoloClass[] = selectedCustom && customName
-    ? [
-        { ...PERSON_CLASS, conf: normalizeClassConfidence(personConfidence) },
-        {
-          ...selectedCustom,
-          model: customName,
-          conf: normalizeClassConfidence(customConfidence),
-        },
-      ]
-    : [{ ...PERSON_CLASS, conf: normalizeClassConfidence(personConfidence) }];
+  const anchorSelected = anchorClasses.find((item) => item.id === anchorId) ?? null;
+  const targetSelected = targetClasses.find((item) => item.id === targetId) ?? null;
+  const selectedClasses: SelectedYoloClass[] = [
+    ...(anchorSelected
+      ? [{ ...anchorSelected, model: ANCHOR_LANE, conf: normalizeClassConfidence(anchorConfidence) }]
+      : []),
+    ...(targetSelected
+      ? [{ ...targetSelected, model: TARGET_LANE, conf: normalizeClassConfidence(targetConfidence) }]
+      : []),
+  ];
   const canApply = canApplyMeasurementSettings(
     enabled,
-    selectedCustom ? 1 : 0,
+    anchorSelected != null,
+    targetSelected != null,
     canEnable,
-    customWeightsAvailable,
+    targetAvailable,
   );
 
-  const confirm = () => {
-    if (canApply) onConfirm(enabled, selectedClasses);
-  };
+  const alertIcon = (
+    <svg
+      className="ico"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <path d="M12 4.2 2.6 19.2a1.2 1.2 0 0 0 1 1.8h16.8a1.2 1.2 0 0 0 1-1.8z" />
+      <path d="M12 10v4.5" />
+      <circle cx="12" cy="17.6" r=".9" fill="currentColor" stroke="none" />
+    </svg>
+  );
 
   return (
     <Modal
       open={open}
       onClose={locked ? () => {} : onClose}
       title={`${cameraName} · 자동 측정 설정`}
-      maxWidth={620}
+      maxWidth={680}
     >
       <section className="measure-weights" aria-labelledby="measure-weights-title">
         <div className="measure-weights-head">
           <div>
             <strong id="measure-weights-title">추론 가중치</strong>
-            <p>기본 person 모델과 커스텀 모델을 동시에 사용합니다.</p>
+            <p>레인별 가중치 1개 · 클래스 1개</p>
           </div>
-          <span className={`measure-weight-badge${customWeightsAvailable ? " custom" : " missing"}`}>
-            <svg
-              className="ico measure-weight-alert"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              aria-hidden="true"
-              focusable="false"
-            >
-              <path d="M12 4.2 2.6 19.2a1.2 1.2 0 0 0 1 1.8h16.8a1.2 1.2 0 0 0 1-1.8z" />
-              <path d="M12 10v4.5" />
-              <circle cx="12" cy="17.6" r=".9" fill="currentColor" stroke="none" />
-            </svg>
-            {customWeightsAvailable ? "DUAL" : "CUSTOM 필요"}
+          <span className={`measure-weight-badge${targetAvailable ? " custom" : " missing"}`}>
+            {targetAvailable ? "준비됨" : "상대 레인 가중치 필요"}
           </span>
         </div>
         <div className="measure-weight-stack">
-          <div className="measure-weight-current">
-            <span>PERSON · 고정</span>
-            <strong>{weights?.preset_name ?? "불러오는 중…"}</strong>
-            <small>person</small>
-          </div>
-          <div className="measure-weight-current">
-            <span>CUSTOM</span>
-            <strong>{weights?.custom?.name ?? "업로드되지 않음"}</strong>
-            {weights?.custom ? (
-              <small>
-                클래스 {weights.custom.class_count}개 · {weights.custom.size_mb.toFixed(2)} MB
-              </small>
-            ) : <small>자동 측정 전에 업로드하세요</small>}
-          </div>
-        </div>
-        <div className="measure-weight-upload">
-          <input
-            key={selectionResetToken}
-            type="file"
-            accept=".pt"
-            disabled={locked}
-            aria-label="YOLO custom .pt 가중치 파일"
-            onChange={(event) => setWeightFile(event.target.files?.[0] ?? null)}
+          <MeasurementLaneCard
+            key={`${ANCHOR_LANE}-${selectionResetToken}`}
+            lane={ANCHOR_LANE}
+            label={LANE_LABEL[ANCHOR_LANE]}
+            status={anchorStatus}
+            classes={anchorClasses}
+            selectedId={anchorId}
+            confidence={anchorConfidence}
+            locked={locked}
+            onSelect={(classId) => {
+              setAnchorId(classId);
+              setAnchorConfidence(DEFAULT_CLASS_CONFIDENCE);
+            }}
+            onConfidence={setAnchorConfidence}
+            onUpload={(file) => onUploadWeights(ANCHOR_LANE, file)}
+            onReset={() => onResetWeights(ANCHOR_LANE)}
           />
-          <button
-            type="button"
-            className="btn sm"
-            disabled={locked || weightFile == null}
-            onClick={() => weightFile && onUploadWeights(weightFile)}
-          >
-            {weightsBusy ? "업로드 중…" : "업로드"}
-          </button>
+          <MeasurementLaneCard
+            key={`${TARGET_LANE}-${selectionResetToken}`}
+            lane={TARGET_LANE}
+            label={LANE_LABEL[TARGET_LANE]}
+            status={targetStatus}
+            classes={targetClasses}
+            selectedId={targetId}
+            confidence={targetConfidence}
+            locked={locked}
+            onSelect={(classId) => {
+              setTargetId(classId);
+              setTargetConfidence(DEFAULT_CLASS_CONFIDENCE);
+            }}
+            onConfidence={setTargetConfidence}
+            onUpload={(file) => onUploadWeights(TARGET_LANE, file)}
+            onReset={() => onResetWeights(TARGET_LANE)}
+          />
         </div>
-        {customWeightsAvailable && (
-          <button
-            type="button"
-            className="btn sm measure-weight-reset"
-            disabled={locked}
-            onClick={onResetWeights}
-          >
-            커스텀 가중치 제거
-          </button>
-        )}
         {weightsBusy && (
-          <p className="measure-weight-progress" role="status">
-            가중치를 검증하고 적용하는 중입니다…
-          </p>
+          <p className="measure-weight-progress" role="status">가중치 검증·적용 중</p>
         )}
         {weightsError && <p className="measure-weight-error" role="alert">{weightsError}</p>}
       </section>
@@ -222,7 +245,7 @@ export default function MeasurementClassModal({
           <button
             type="button"
             className={`btn sm${enabled ? " selected on" : ""}`}
-            disabled={locked || !canEnable || !customWeightsAvailable}
+            disabled={locked || !canEnable || !targetAvailable}
             aria-pressed={enabled}
             onClick={() => setEnabled(true)}
           >
@@ -231,143 +254,14 @@ export default function MeasurementClassModal({
         </div>
       </div>
       {!canEnable && (
-        <p className="measure-state-warning">
-          <svg
-            className="ico"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.5"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            aria-hidden="true"
-            focusable="false"
-          >
-            <path d="M12 4.2 2.6 19.2a1.2 1.2 0 0 0 1 1.8h16.8a1.2 1.2 0 0 0 1-1.8z" />
-            <path d="M12 10v4.5" />
-            <circle cx="12" cy="17.6" r=".9" fill="currentColor" stroke="none" />
-          </svg>
-          ON으로 설정하려면 기준점을 저장하고 측정을 활성화하세요.
-        </p>
+        <p className="measure-state-warning">{alertIcon}ON 조건 — 기준점 저장 · 측정 활성화</p>
       )}
-      {!customWeightsAvailable && (
-        <p className="measure-state-warning">
-          <svg
-            className="ico"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.5"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            aria-hidden="true"
-            focusable="false"
-          >
-            <path d="M12 4.2 2.6 19.2a1.2 1.2 0 0 0 1 1.8h16.8a1.2 1.2 0 0 0 1-1.8z" />
-            <path d="M12 10v4.5" />
-            <circle cx="12" cy="17.6" r=".9" fill="currentColor" stroke="none" />
-          </svg>
-          자동 측정을 켜려면 custom .pt 가중치를 업로드하세요.
-        </p>
+      {!targetAvailable && (
+        <p className="measure-state-warning">{alertIcon}ON 조건 — 상대 레인 가중치 업로드</p>
       )}
-
-      <p className="measure-class-help">
-        yolo26x의 person은 고정입니다. custom 가중치에서 거리 상대 클래스 1개를 선택하세요.
-      </p>
-      <div className="measure-person-fixed" aria-label="고정 기준 클래스">
-        <svg
-          className="ico"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="1.5"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          aria-hidden="true"
-          focusable="false"
-        >
-          <circle cx="12" cy="7" r="3" />
-          <path d="M5.5 20v-1a6.5 6.5 0 0 1 13 0v1" />
-        </svg>
-        <span>기준 클래스</span>
-        <strong>person</strong>
-        <small>{weights?.preset_name ?? "yolo26x.pt"}</small>
-      </div>
-      <div className="field">
-        <label htmlFor="measure-class-search">Custom 클래스 검색</label>
-        <input
-          id="measure-class-search"
-          value={query}
-          onChange={(event) => setQuery(event.target.value)}
-          placeholder="forklift, pallet ..."
-          disabled={!customWeightsAvailable}
-          autoFocus
-        />
-      </div>
-      <div className="measure-class-summary" role="status">
-        <span>Custom 선택 {selectedCustom ? 1 : 0}/1</span>
-        <span className="measure-class-chip">person · 고정</span>
-        {selectedCustom && <span className="measure-class-chip">{selectedCustom.name}</span>}
-      </div>
-
-      <div className="measure-confidence-list" aria-label="클래스별 confidence 설정">
-        <label className="measure-confidence-row">
-          <span className="measure-confidence-name">person</span>
-          <input
-            type="range"
-            min={MIN_CLASS_CONFIDENCE}
-            max={MAX_CLASS_CONFIDENCE}
-            step="0.05"
-            value={personConfidence}
-            disabled={locked}
-            onChange={(event) => setPersonConfidence(normalizeClassConfidence(Number(event.target.value)))}
-            aria-label="person confidence"
-          />
-          <output>{personConfidence.toFixed(2)}</output>
-        </label>
-        {selectedCustom && (
-          <label className="measure-confidence-row">
-            <span className="measure-confidence-name">{selectedCustom.name}</span>
-            <input
-              type="range"
-              min={MIN_CLASS_CONFIDENCE}
-              max={MAX_CLASS_CONFIDENCE}
-              step="0.05"
-              value={customConfidence}
-              disabled={locked}
-              onChange={(event) => setCustomConfidence(normalizeClassConfidence(Number(event.target.value)))}
-              aria-label={`${selectedCustom.name} confidence`}
-            />
-            <output>{customConfidence.toFixed(2)}</output>
-          </label>
-        )}
-      </div>
-
-      <div className="measure-class-grid" aria-label="Custom YOLO 클래스 목록">
-        {visible.map((item) => {
-          const checked = selectedCustomId === item.id;
-          return (
-            <label className={`measure-class-option${checked ? " selected" : ""}`} key={item.id}>
-              <input
-                type="radio"
-                name="measure-custom-class"
-                checked={checked}
-                disabled={locked || !customWeightsAvailable}
-                onChange={() => {
-                  setSelectedCustomId(item.id);
-                  setCustomConfidence(DEFAULT_CLASS_CONFIDENCE);
-                }}
-              />
-              <span>{item.name}</span>
-            </label>
-          );
-        })}
-        {visible.length === 0 && (
-          <p className="measure-class-empty">
-            {customWeightsAvailable ? "일치하는 클래스가 없습니다." : "Custom 가중치를 먼저 업로드하세요."}
-          </p>
-        )}
-      </div>
+      {enabled && !(anchorSelected && targetSelected) && (
+        <p className="measure-state-warning">{alertIcon}적용 조건 — 레인별 클래스 1개 선택</p>
+      )}
 
       <div className="modal-actions">
         <button type="button" className="btn" disabled={locked} onClick={onClose}>취소</button>
@@ -375,7 +269,7 @@ export default function MeasurementClassModal({
           type="button"
           className="btn primary"
           disabled={locked || !canApply}
-          onClick={confirm}
+          onClick={() => canApply && onConfirm(enabled, selectedClasses)}
         >
           {saving ? "저장 중…" : "적용"}
         </button>

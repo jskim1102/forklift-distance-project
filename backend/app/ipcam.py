@@ -388,26 +388,29 @@ def set_ipcam_inference(
         raise HTTPException(status_code=404, detail="IP CAM을 찾을 수 없습니다")
 
     source_id = _source_id(stream_key)
-    expected_models = models_dir.get_active_model_names()
-    custom_available = len(expected_models) == 2
+    expected_models = models_dir.get_active_lanes()
+    target_available = "target" in expected_models
     requested_models = (
         body.models
         if body.models is not None
         else stream_manager.get_source_models(source_id)
     )
+    # 레인 미업로드가 먼저다 — 뒤로 밀면 "보낸 그대로 보내라"는 엉뚱한 문구가 나간다.
+    if body.enabled is True and not target_available:
+        raise HTTPException(
+            status_code=400,
+            detail="자동 측정에는 상대 레인 가중치 업로드 필요",
+        )
     if body.models is not None and body.models != expected_models:
         raise HTTPException(
             status_code=400,
-            detail="models는 현재 yolo26x.pt와 custom 가중치의 두 lane이어야 합니다",
+            detail="models는 활성 레인 anchor·target 두 개여야 합니다",
         )
-    if body.enabled is True:
-        if not custom_available:
-            raise HTTPException(status_code=400, detail="custom 가중치가 필요합니다")
-        if requested_models != expected_models:
-            raise HTTPException(
-                status_code=400,
-                detail="자동 측정에는 yolo26x.pt와 custom 가중치가 모두 필요합니다",
-            )
+    if body.enabled is True and requested_models != expected_models:
+        raise HTTPException(
+            status_code=400,
+            detail="자동 측정에는 활성 레인 anchor·target 두 개 모두 필요",
+        )
 
     if body.enabled is not None:
         stream_manager.set_source_inference_enabled(source_id, body.enabled)
