@@ -9,6 +9,7 @@ import {
   ANCHOR_LANE,
   canApplyMeasurementSettings,
   DEFAULT_CLASS_CONFIDENCE,
+  hasSameClassName,
   normalizeClassConfidence,
   TARGET_LANE,
 } from "../utils/detectionPairs";
@@ -132,6 +133,7 @@ export default function MeasurementClassModal({
   const locked = saving || weightsBusy;
   const anchorSelected = anchorClasses.find((item) => item.id === anchorId) ?? null;
   const targetSelected = targetClasses.find((item) => item.id === targetId) ?? null;
+  const sameClassName = hasSameClassName(anchorSelected, targetSelected);
   const selectedClasses: SelectedYoloClass[] = [
     ...(anchorSelected
       ? [{ ...anchorSelected, model: ANCHOR_LANE, conf: normalizeClassConfidence(anchorConfidence) }]
@@ -142,8 +144,8 @@ export default function MeasurementClassModal({
   ];
   const canApply = canApplyMeasurementSettings(
     enabled,
-    anchorSelected != null,
-    targetSelected != null,
+    anchorSelected,
+    targetSelected,
     canEnable,
     targetAvailable,
   );
@@ -261,6 +263,9 @@ export default function MeasurementClassModal({
       )}
       {enabled && !(anchorSelected && targetSelected) && (
         <p className="measure-state-warning">{alertIcon}적용 조건 — 레인별 클래스 1개 선택</p>
+      )}
+      {sameClassName && (
+        <p className="measure-state-warning">{alertIcon}적용 조건 — 기준·상대 클래스는 서로 달라야 함</p>
       )}
 
       <div className="modal-actions">

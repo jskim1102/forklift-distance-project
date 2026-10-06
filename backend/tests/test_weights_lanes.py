@@ -32,34 +32,32 @@ def _write_slot(directory: Path, lane: str, *, original_name: str, classes: list
     )
 
 
-def test_empty_anchor_slot_falls_back_to_preset(weights_dir: Path) -> None:
-    status = models_dir.get_lane_status("anchor")
+@pytest.mark.parametrize("lane", ["anchor", "target"])
+def test_empty_slot_falls_back_to_preset(weights_dir: Path, lane: str) -> None:
+    status = models_dir.get_lane_status(lane)
 
     assert status == {
-        "lane": "anchor",
+        "lane": lane,
         "source": "preset",
         "name": "yolo26x.pt",
         "uploaded_at": None,
         "size_mb": None,
         "class_count": 80,
     }
-    assert models_dir.resolve_model_path("anchor") == "yolo26x.pt"
-    assert models_dir.list_lane_classes("anchor")[0] == {"id": 0, "name": "person"}
-    assert len(models_dir.list_lane_classes("anchor")) == 80
+    assert models_dir.resolve_model_path(lane) == "yolo26x.pt"
+    assert models_dir.list_lane_classes(lane)[0] == {"id": 0, "name": "person"}
+    assert len(models_dir.list_lane_classes(lane)) == 80
 
 
-def test_empty_target_slot_is_inactive_and_has_no_classes(weights_dir: Path) -> None:
-    assert models_dir.get_lane_status("target") is None
-    assert models_dir.get_active_lanes() == ["anchor"]
+def test_both_empty_slots_are_active_without_creating_uploads(weights_dir: Path) -> None:
+    assert models_dir.get_active_lanes() == ["anchor", "target"]
     assert models_dir.get_all_lane_status() == {
         "anchor": models_dir.get_lane_status("anchor"),
-        "target": None,
+        "target": models_dir.get_lane_status("target"),
     }
-    assert not models_dir.is_allowed_model("target")
-    with pytest.raises(ValueError):
-        models_dir.list_lane_classes("target")
-    with pytest.raises(ValueError):
-        models_dir.resolve_model_path("target")
+    assert models_dir.is_allowed_model("anchor")
+    assert models_dir.is_allowed_model("target")
+    assert list(weights_dir.iterdir()) == []
 
 
 def test_anchor_upload_replaces_slot_atomically(weights_dir: Path) -> None:
@@ -126,7 +124,7 @@ def test_preset_filename_is_accepted_as_an_uploaded_lane_name(weights_dir: Path)
     assert models_dir.resolve_model_path("target") == str(weights_dir / "target.pt")
 
 
-def test_delete_returns_anchor_to_preset_and_target_to_inactive(weights_dir: Path) -> None:
+def test_delete_returns_both_lanes_to_preset(weights_dir: Path) -> None:
     _write_slot(weights_dir, "anchor", original_name="a.pt", classes=[{"id": 0, "name": "a"}])
     _write_slot(weights_dir, "target", original_name="t.pt", classes=[{"id": 1, "name": "t"}])
 
@@ -138,8 +136,10 @@ def test_delete_returns_anchor_to_preset_and_target_to_inactive(weights_dir: Pat
     assert not (weights_dir / "target.pt").exists()
     assert not (weights_dir / "target.json").exists()
     assert models_dir.get_lane_status("anchor")["source"] == "preset"
-    assert models_dir.get_lane_status("target") is None
-    assert models_dir.get_active_lanes() == ["anchor"]
+    assert models_dir.get_lane_status("target")["source"] == "preset"
+    assert models_dir.resolve_model_path("target") == "yolo26x.pt"
+    assert len(models_dir.list_lane_classes("target")) == 80
+    assert models_dir.get_active_lanes() == ["anchor", "target"]
 
 
 def test_legacy_custom_slot_migrates_to_target_and_is_idempotent(weights_dir: Path) -> None:
@@ -187,8 +187,33 @@ def test_legacy_custom_slot_is_ignored_when_target_already_exists(weights_dir: P
     assert (weights_dir / "custom.json").is_file()
 
 
+@pytest.mark.parametrize("with_legacy_metadata", [False, True])
+def test_orphan_target_metadata_never_pairs_with_legacy_weights(
+    weights_dir: Path, with_legacy_metadata: bool
+) -> None:
+    _write_slot(weights_dir, "target", original_name="best.pt", classes=[{"id": 0, "name": "forklift"}])
+    (weights_dir / "target.pt").unlink()
+    metadata = json.loads((weights_dir / "target.json").read_text())
+    metadata["size_bytes"] = 20312965
+    (weights_dir / "target.json").write_text(json.dumps(metadata))
+    original_metadata = (weights_dir / "target.json").read_bytes()
+    if with_legacy_metadata:
+        _write_slot(weights_dir, "custom", original_name="legacy.pt", classes=[{"id": 0, "name": "box"}])
+    (weights_dir / "custom.pt").write_bytes(b"x" * 24)
+
+    assert models_dir.get_all_lane_status()["target"]["source"] == "preset"
+    assert models_dir.get_lane_metadata("target") is None
+    assert models_dir.list_lane_classes("target")[0] == {"id": 0, "name": "person"}
+    assert len(models_dir.list_lane_classes("target")) == 80
+    assert not (weights_dir / "target.pt").exists()
+    assert (weights_dir / "target.json").read_bytes() == original_metadata
+    assert (weights_dir / "custom.pt").read_bytes() == b"x" * 24
+    if with_legacy_metadata:
+        assert (weights_dir / "custom.json").is_file()
+
+
 @pytest.mark.parametrize("failed_filename", ["custom.json", "custom.pt"])
-def test_interrupted_legacy_migration_stays_inactive_and_retries_without_data_loss(
+def test_interrupted_legacy_migration_preserves_data_and_can_recover(
     weights_dir: Path, monkeypatch, failed_filename: str
 ) -> None:
     _write_slot(
@@ -206,7 +231,7 @@ def test_interrupted_legacy_migration_stays_inactive_and_retries_without_data_lo
 
     monkeypatch.setattr(models_dir.os, "replace", interrupted_replace)
 
-    assert models_dir.get_lane_status("target") is None
+    assert models_dir.get_lane_status("target")["source"] == "preset"
     assert moves == (
         ["custom.json"] if failed_filename == "custom.json" else ["custom.json", "custom.pt"]
     )
@@ -217,6 +242,23 @@ def test_interrupted_legacy_migration_stays_inactive_and_retries_without_data_lo
 
     monkeypatch.setattr(models_dir.os, "replace", replace)
 
+    if failed_filename == "custom.pt":
+        # An orphan target.json cannot safely be attributed to custom.pt on retry.
+        assert models_dir.get_lane_status("target")["source"] == "preset"
+        assert (weights_dir / "custom.pt").read_bytes() == b"weights"
+        assert (weights_dir / "target.json").read_bytes() == original_metadata
+        upload = weights_dir / ".upload-target.pt"
+        upload.write_bytes(b"new-weights")
+        models_dir.activate_lane_weights(
+            upload, lane="target", original_name="recovered.pt", size_bytes=11,
+            classes=[{"id": 0, "name": "box"}],
+        )
+        assert models_dir.get_lane_status("target")["name"] == "recovered.pt"
+        assert models_dir.list_lane_classes("target") == [{"id": 0, "name": "box"}]
+        assert (weights_dir / "target.pt").read_bytes() == b"new-weights"
+        assert (weights_dir / "custom.pt").read_bytes() == b"weights"
+        return
+
     assert models_dir.get_lane_status("target")["name"] == "best.pt"
     assert models_dir.get_active_lanes() == ["anchor", "target"]
     assert (weights_dir / "target.pt").read_bytes() == b"weights"
@@ -225,11 +267,12 @@ def test_interrupted_legacy_migration_stays_inactive_and_retries_without_data_lo
     assert not (weights_dir / "custom.json").exists()
 
 
-def test_half_written_slots_are_treated_as_inactive(weights_dir: Path) -> None:
+def test_half_written_slots_fall_back_to_preset(weights_dir: Path) -> None:
     (weights_dir / "target.pt").write_bytes(b"weights")
 
     assert models_dir.get_lane_metadata("target") is None
-    assert models_dir.get_lane_status("target") is None
+    assert models_dir.get_lane_status("target")["source"] == "preset"
+    assert models_dir.resolve_model_path("target") == "yolo26x.pt"
 
     (weights_dir / "target.pt").unlink()
     (weights_dir / "target.json").write_text(
@@ -245,7 +288,8 @@ def test_half_written_slots_are_treated_as_inactive(weights_dir: Path) -> None:
     )
 
     assert models_dir.get_lane_metadata("target") is None
-    assert models_dir.get_lane_status("target") is None
+    assert models_dir.get_lane_status("target")["source"] == "preset"
+    assert models_dir.resolve_model_path("target") == "yolo26x.pt"
 
     (weights_dir / "anchor.json").write_text("not json", encoding="utf-8")
     (weights_dir / "anchor.pt").write_bytes(b"weights")

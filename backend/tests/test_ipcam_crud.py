@@ -210,8 +210,10 @@ def test_per_camera_inference_cannot_enable_without_the_target_lane(
     tmp_path,
 ):
     from app import config
+    from app.inference import models_dir
 
     monkeypatch.setattr(config, "WEIGHTS_DIR", tmp_path)
+    monkeypatch.setitem(models_dir.LANE_PRESET, "target", None)
     cam = client.post(
         "/api/ipcams",
         json={"name": "measure", "rtsp_url": "rtsp://x/no-target"},
@@ -240,6 +242,25 @@ def test_per_camera_inference_cannot_enable_without_the_target_lane(
     )
     assert response.status_code == 400
     assert response.json()["detail"] == "models는 활성 레인 anchor·target 두 개여야 합니다"
+
+
+def test_per_camera_inference_can_enable_with_presets_and_no_uploads(client, monkeypatch, tmp_path):
+    from app import config
+
+    monkeypatch.setattr(config, "WEIGHTS_DIR", tmp_path)
+    cam = client.post(
+        "/api/ipcams", json={"name": "presets", "rtsp_url": "rtsp://x/presets"},
+    ).json()
+    endpoint = f"/api/ipcams/{cam['stream_key']}/inference"
+
+    response = client.put(endpoint, json={"enabled": True, "models": ["anchor", "target"]})
+
+    assert response.status_code == 200
+    assert response.json()["enabled"] is True
+    assert response.json()["models"] == ["anchor", "target"]
+    assert client.get(endpoint).json()["enabled"] is True
+    assert list(tmp_path.iterdir()) == []
+    assert client.put(endpoint, json={"enabled": True, "models": ["anchor"]}).status_code == 400
 
 
 # ─── net-new: mediamtx 사이드이펙트 배선 (test-first) ───

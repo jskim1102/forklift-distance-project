@@ -14,7 +14,7 @@ export const MAX_CLASS_CONFIDENCE = 0.95;
 
 /** 거리쌍 기준 레인. 업로드가 없으면 preset(yolo26x.pt)으로 떨어진다. */
 export const ANCHOR_LANE = "anchor";
-/** 거리쌍 상대 레인. 업로드해야 활성이다. */
+/** 거리쌍 상대 레인. 업로드가 없으면 preset(yolo26x.pt)으로 떨어진다. */
 export const TARGET_LANE = "target";
 export const LANE_IDS: readonly string[] = [ANCHOR_LANE, TARGET_LANE];
 
@@ -34,14 +34,23 @@ export function modelClassKey(model: string, classId: number): string {
   return `${model}\u0000${classId}`;
 }
 
+export function hasSameClassName(
+  anchor: YoloClass | null | undefined,
+  target: YoloClass | null | undefined,
+): boolean {
+  return anchor != null && target != null
+    && anchor.name.trim().toLowerCase() === target.name.trim().toLowerCase();
+}
+
 export function canApplyMeasurementSettings(
   enabled: boolean,
-  hasAnchor: boolean,
-  hasTarget: boolean,
+  anchor: YoloClass | null,
+  target: YoloClass | null,
   canEnable: boolean,
   targetAvailable: boolean,
 ): boolean {
-  return !enabled || (canEnable && targetAvailable && hasAnchor && hasTarget);
+  return !hasSameClassName(anchor, target)
+    && (!enabled || (canEnable && targetAvailable && anchor != null && target != null));
 }
 
 export function normalizeClassConfidence(value: unknown): number {
@@ -53,9 +62,10 @@ export function normalizeClassConfidence(value: unknown): number {
 /**
  * 저장된 선택을 현재 레인 상태에 비춰 복원한다.
  *
- * 셋 다 만족할 때만 살린다 — (1) model 이 레인 id, (2) 그 레인이 활성,
- * (3) 그 레인의 클래스 목록에 같은 id 가 있고 이름도 같다. 이름까지 보는 이유는
+ * (1) model 이 레인 id, (2) 그 레인이 활성,
+ * (3) 그 레인의 클래스 목록에 같은 id 가 있고 이름도 같을 때 복원한다. 이름까지 보는 이유는
  * 같은 id 가 다른 클래스로 바뀐 모델 교체를 걸러야 하기 때문이다.
+ * 두 레인의 클래스명이 같으면 상대 선택을 해제한다 — 같은 검출끼리 짝지어지는 것을 막는다.
  */
 export function restoreSelection(
   stored: readonly SelectedYoloClass[],
@@ -69,6 +79,11 @@ export function restoreSelection(
       (candidate) => candidate.id === item.id && candidate.name === item.name,
     );
   });
+  const anchor = classes.find((item) => item.model === ANCHOR_LANE);
+  const target = classes.find((item) => item.model === TARGET_LANE);
+  if (hasSameClassName(anchor, target)) {
+    return { classes: classes.filter((item) => item.model !== TARGET_LANE), dropped: true };
+  }
   return { classes, dropped: classes.length !== stored.length };
 }
 

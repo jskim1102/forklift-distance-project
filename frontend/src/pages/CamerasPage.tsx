@@ -128,6 +128,7 @@ export default function CamerasPage({ onCalibrate }: Props) {
   const [measureCanEnable, setMeasureCanEnable] = useState(false);
   const [laneClasses, setLaneClasses] = useState<LaneClasses>(EMPTY_LANE_CLASSES);
   const [weights, setWeights] = useState<WeightsStatus | null>(null);
+  const [restoreError, setRestoreError] = useState("");
   const [weightsBusy, setWeightsBusy] = useState(false);
   const [weightsError, setWeightsError] = useState("");
   const [selectionResetToken, setSelectionResetToken] = useState(0);
@@ -260,22 +261,31 @@ export default function CamerasPage({ onCalibrate }: Props) {
   // 클래스 id가 다른 객체를 가리키는 동안 자동 측정이 계속 표시될 수 있다.
   useEffect(() => {
     let cancelled = false;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
     async function restoreMeasurements() {
-      const response = await fetch(`${apiBase()}/api/inference/weights`);
-      if (!response.ok) throw new Error("활성 가중치 정보를 불러오지 못했습니다.");
-      const nextWeights = await response.json() as WeightsStatus;
-      const nextClasses = await loadAllLaneClasses(nextWeights);
-      if (cancelled) return;
-      setWeights(nextWeights);
-      setLaneClasses(nextClasses);
-      await syncMeasurementsWithLanes(nextClasses);
-    }
-    restoreMeasurements().catch((reason) => {
-      if (!cancelled) {
-        setError(reason instanceof Error ? reason.message : "저장된 측정 설정을 확인하지 못했습니다.");
+      try {
+        const response = await fetch(`${apiBase()}/api/inference/weights`);
+        if (!response.ok) throw new Error("활성 가중치 정보를 불러오지 못했습니다.");
+        const nextWeights = await response.json() as WeightsStatus;
+        const nextClasses = await loadAllLaneClasses(nextWeights);
+        if (cancelled) return;
+        setWeights(nextWeights);
+        setLaneClasses(nextClasses);
+        setRestoreError("");
+        await syncMeasurementsWithLanes(nextClasses);
+      } catch (reason) {
+        if (cancelled) return;
+        const message = reason instanceof Error ? reason.message : "저장된 측정 설정을 확인하지 못했습니다.";
+        setRestoreError(`${message} 5초 후 다시 시도합니다.`);
+        // 서버 재시작 중 진입해도 검증된 설정으로 복구한다. 실패 중에는 overlay gate를 유지한다.
+        retryTimer = setTimeout(restoreMeasurements, 5000);
       }
-    });
-    return () => { cancelled = true; };
+    }
+    void restoreMeasurements();
+    return () => {
+      cancelled = true;
+      clearTimeout(retryTimer);
+    };
   }, [syncMeasurementsWithLanes]);
 
   async function openAutoMeasurementSettings(cam: Cam) {
@@ -453,6 +463,7 @@ export default function CamerasPage({ onCalibrate }: Props) {
 
       <div className="content cameras-content">
         {error && <p className="form-error">{error}</p>}
+        {restoreError && <p className="form-error" role="alert">{restoreError}</p>}
 
         <section className="kpis" aria-label="카메라 현황">
           <div className="panel kpi">

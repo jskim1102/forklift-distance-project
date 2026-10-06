@@ -30,8 +30,8 @@ logger = logging.getLogger(__name__)
 # 레인 둘로 고정. 개수를 늘릴 계획이 없어 슬롯 파일 두 쌍이면 충분하다.
 LANES: tuple[str, ...] = ("anchor", "target")
 DEFAULT_LANE = "anchor"
-# 업로드가 없을 때의 fallback. target 은 preset 이 없어 업로드해야 활성이다.
-LANE_PRESET: dict[str, str | None] = {"anchor": "yolo26x.pt", "target": None}
+# 업로드가 없으면 두 레인 모두 COCO preset 으로 동작한다.
+LANE_PRESET: dict[str, str | None] = {"anchor": "yolo26x.pt", "target": "yolo26x.pt"}
 
 DEFAULT_MODEL = "yolo26x.pt"  # preset 카탈로그 기본값
 LEGACY_CUSTOM_WEIGHTS_FILENAME = "custom.pt"
@@ -164,16 +164,20 @@ def _migrate_legacy_target_slot() -> None:
 
     startup 훅이 아니라 조회 함수에서 부른다 — streaming.manager 싱글턴이 모듈 import
     시점에 활성 레인을 읽으므로 startup 훅은 그보다 늦다. target 슬롯이 이미 차 있으면
-    레거시 파일을 건드리지 않는다(멱등). 실패해도 target 비활성으로 진행하고, 사용자는
-    재업로드로 회복한다.
+    레거시 파일을 건드리지 않는다(멱등). 실패하면 target preset 으로 진행하고, 사용자는
+    재업로드로 업로드 모델을 회복한다.
     """
     target_weights = lane_weights_path("target")
     legacy_weights = _legacy_custom_weights_path()
-    if target_weights.exists() or not legacy_weights.is_file():
+    if (
+        target_weights.exists()
+        or lane_metadata_path("target").exists()
+        or not legacy_weights.is_file()
+    ):
         return
     legacy_metadata = _legacy_custom_metadata_path()
     try:
-        # .json 을 먼저 옮긴다 — 중간에 죽어도 .pt 없는 반쪽 상태는 비활성으로 처리된다.
+        # .json 을 먼저 옮긴다 — 중간에 죽어도 .pt 없는 반쪽 상태는 preset 으로 처리된다.
         if legacy_metadata.is_file():
             os.replace(legacy_metadata, lane_metadata_path("target"))
         os.replace(legacy_weights, target_weights)

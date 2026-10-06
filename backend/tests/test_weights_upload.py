@@ -24,6 +24,7 @@ PRESET_ANCHOR = {
     "size_mb": None,
     "class_count": 80,
 }
+PRESET_TARGET = {**PRESET_ANCHOR, "lane": "target"}
 
 
 @pytest.fixture()
@@ -69,7 +70,7 @@ def _upload(http: TestClient, lane: str, filename: str, payload: bytes = b"model
     )
 
 
-def test_default_status_reports_preset_anchor_and_inactive_target(
+def test_default_status_reports_two_preset_lanes_and_their_classes(
     client: tuple[TestClient, MagicMock, MagicMock, MagicMock],
 ) -> None:
     http, _set_model, _set_all_sources, _reload_model = client
@@ -77,8 +78,12 @@ def test_default_status_reports_preset_anchor_and_inactive_target(
     response = http.get("/api/inference/weights")
 
     assert response.status_code == 200
-    assert response.json() == {"lanes": {"anchor": PRESET_ANCHOR, "target": None}}
-    assert http.get("/api/inference/lanes/target/classes").status_code == 404
+    assert response.json() == {"lanes": {"anchor": PRESET_ANCHOR, "target": PRESET_TARGET}}
+    for lane in ("anchor", "target"):
+        classes_response = http.get(f"/api/inference/lanes/{lane}/classes")
+        assert classes_response.status_code == 200
+        assert len(classes_response.json()) == 80
+        assert classes_response.json()[0] == {"id": 0, "name": "person"}
 
 
 def test_target_upload_persists_slot_and_activates_both_lanes(
@@ -129,7 +134,7 @@ def test_anchor_upload_replaces_preset_without_renaming_the_lane(
     assert anchor["name"] == "site.pt"
     assert (weights_dir / "anchor.pt").read_bytes() == b"anchor-bytes"
     reload_model.assert_called_once_with("anchor")
-    set_all_sources.assert_called_once_with(["anchor"])
+    set_all_sources.assert_called_once_with(["anchor", "target"])
     assert http.get("/api/inference/lanes/anchor/classes").json() == [
         {"id": 0, "name": "forklift"},
         {"id": 4, "name": "pallet"},
@@ -167,7 +172,7 @@ def test_unknown_lane_is_rejected_on_every_lane_endpoint(
     reload_model.assert_not_called()
 
 
-def test_target_delete_deactivates_the_lane_without_reload(
+def test_target_delete_returns_to_preset_and_reloads_the_lane(
     client: tuple[TestClient, MagicMock, MagicMock, MagicMock],
     weights_dir: Path,
 ) -> None:
@@ -179,12 +184,12 @@ def test_target_delete_deactivates_the_lane_without_reload(
     response = http.delete("/api/inference/lanes/target/weights")
 
     assert response.status_code == 200
-    assert response.json() == {"lanes": {"anchor": PRESET_ANCHOR, "target": None}}
+    assert response.json() == {"lanes": {"anchor": PRESET_ANCHOR, "target": PRESET_TARGET}}
     assert not (weights_dir / "target.pt").exists()
     assert not (weights_dir / "target.json").exists()
-    set_all_sources.assert_called_once_with(["anchor"])
-    reload_model.assert_not_called()
-    assert http.get("/api/inference/lanes/target/classes").status_code == 404
+    set_all_sources.assert_called_once_with(["anchor", "target"])
+    reload_model.assert_called_once_with("target")
+    assert len(http.get("/api/inference/lanes/target/classes").json()) == 80
 
 
 def test_anchor_delete_returns_to_preset_and_reloads_the_surviving_lane(
@@ -202,7 +207,7 @@ def test_anchor_delete_returns_to_preset_and_reloads_the_surviving_lane(
     assert response.json()["lanes"]["anchor"] == PRESET_ANCHOR
     assert not (weights_dir / "anchor.pt").exists()
     reload_model.assert_called_once_with("anchor")
-    set_all_sources.assert_called_once_with(["anchor"])
+    set_all_sources.assert_called_once_with(["anchor", "target"])
     assert len(http.get("/api/inference/lanes/anchor/classes").json()) == 80
 
 
@@ -246,7 +251,7 @@ def test_class_extraction_failure_removes_temporary_upload(
     reload_model.assert_not_called()
 
 
-def test_inference_config_model_accepts_active_lane_ids_only(
+def test_inference_config_rejects_model_even_for_uploaded_active_lane(
     client: tuple[TestClient, MagicMock, MagicMock, MagicMock],
 ) -> None:
     http, set_model, _set_all_sources, _reload_model = client
@@ -256,29 +261,59 @@ def test_inference_config_model_accepts_active_lane_ids_only(
     assert http.put("/api/inference/config", json={"model": "target"}).status_code == 400
     set_model.assert_not_called()
 
-    assert http.put("/api/inference/config", json={"model": "anchor"}).status_code == 200
-    set_model.assert_called_once_with("anchor")
+    assert http.put("/api/inference/config", json={"model": "anchor"}).status_code == 400
 
     assert _upload(http, "target", "warehouse.pt").status_code == 200
-    assert http.put("/api/inference/config", json={"model": "target"}).status_code == 200
+    assert http.put("/api/inference/config", json={"model": "target"}).status_code == 400
+    set_model.assert_not_called()
 
 
-@pytest.mark.parametrize("rejected_model", ["target", "yolo26x.pt", "unknown"])
+@pytest.mark.parametrize("rejected_model", ["anchor", "target", "yolo26x.pt", "unknown", None])
 def test_rejected_model_does_not_change_inference_state(
     client: tuple[TestClient, MagicMock, MagicMock, MagicMock],
     monkeypatch,
-    rejected_model: str,
+    rejected_model: str | None,
 ) -> None:
     http, set_model, _set_all_sources, _reload_model = client
     set_enabled = MagicMock()
+    set_conf = MagicMock()
+    set_gpu = MagicMock()
     monkeypatch.setattr(inference_api.stream_manager, "set_inference_enabled", set_enabled)
+    monkeypatch.setattr(inference_api.stream_manager, "set_inference_conf_threshold", set_conf)
+    monkeypatch.setattr(inference_api.stream_manager, "set_gpu_util_target", set_gpu)
 
     response = http.put(
-        "/api/inference/config", json={"enabled": False, "model": rejected_model}
+        "/api/inference/config", json={
+            "enabled": False, "model": rejected_model, "conf_threshold": 0.6, "gpu_util_target": 0.5,
+        }
     )
 
     assert response.status_code == 400
     set_enabled.assert_not_called()
+    set_conf.assert_not_called()
+    set_gpu.assert_not_called()
+    set_model.assert_not_called()
+
+
+def test_inference_config_still_accepts_updates_without_model(
+    client: tuple[TestClient, MagicMock, MagicMock, MagicMock], monkeypatch,
+) -> None:
+    http, set_model, _set_all_sources, _reload_model = client
+    set_enabled = MagicMock()
+    set_conf = MagicMock()
+    set_gpu = MagicMock()
+    monkeypatch.setattr(inference_api.stream_manager, "set_inference_enabled", set_enabled)
+    monkeypatch.setattr(inference_api.stream_manager, "set_inference_conf_threshold", set_conf)
+    monkeypatch.setattr(inference_api.stream_manager, "set_gpu_util_target", set_gpu)
+
+    response = http.put("/api/inference/config", json={
+        "enabled": False, "conf_threshold": 0.6, "gpu_util_target": 0.5,
+    })
+
+    assert response.status_code == 200
+    set_enabled.assert_called_once_with(False)
+    set_conf.assert_called_once_with(0.6)
+    set_gpu.assert_called_once_with(0.5)
     set_model.assert_not_called()
 
 

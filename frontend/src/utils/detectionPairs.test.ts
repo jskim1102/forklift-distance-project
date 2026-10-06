@@ -85,13 +85,13 @@ describe("buildDetectionPairs", () => {
 
   it("두 레인의 원본 파일명이 같아도 lane id 로 분리한다", () => {
     // 두 레인 모두 best.pt 를 올린 상황 — detection 의 model 값은 레인 id 다.
-    const anchorBox = det(0, "forklift", 0, 0.9, ANCHOR_LANE);
+    const anchorBox = det(0, "person", 0, 0.9, ANCHOR_LANE);
     const targetBox = det(0, "forklift", 30, 0.9, TARGET_LANE);
 
     expect(
       buildDetectionPairs(
         [anchorBox, targetBox],
-        [selected(0, "forklift", ANCHOR_LANE), selected(0, "forklift", TARGET_LANE)],
+        [ANCHOR_PERSON, TARGET_FORKLIFT],
         (from, to) => Math.abs(from.xyxy[0] - to.xyxy[0]),
       ),
     ).toEqual([[anchorBox, targetBox]]);
@@ -177,15 +177,27 @@ describe("filterDetectionsByClassConfidence", () => {
 
 describe("canApplyMeasurementSettings", () => {
   it("OFF는 클래스 선택 없이 적용할 수 있다", () => {
-    expect(canApplyMeasurementSettings(false, false, false, false, false)).toBe(true);
+    expect(canApplyMeasurementSettings(false, null, null, false, false)).toBe(true);
   });
 
   it("ON은 기준점·상대 레인 활성·레인별 클래스 1개가 모두 필요하다", () => {
-    expect(canApplyMeasurementSettings(true, false, true, true, true)).toBe(false);
-    expect(canApplyMeasurementSettings(true, true, false, true, true)).toBe(false);
-    expect(canApplyMeasurementSettings(true, true, true, false, true)).toBe(false);
-    expect(canApplyMeasurementSettings(true, true, true, true, false)).toBe(false);
-    expect(canApplyMeasurementSettings(true, true, true, true, true)).toBe(true);
+    expect(canApplyMeasurementSettings(true, null, TARGET_FORKLIFT, true, true)).toBe(false);
+    expect(canApplyMeasurementSettings(true, ANCHOR_PERSON, null, true, true)).toBe(false);
+    expect(canApplyMeasurementSettings(true, ANCHOR_PERSON, TARGET_FORKLIFT, false, true)).toBe(false);
+    expect(canApplyMeasurementSettings(true, ANCHOR_PERSON, TARGET_FORKLIFT, true, false)).toBe(false);
+    expect(canApplyMeasurementSettings(true, ANCHOR_PERSON, TARGET_FORKLIFT, true, true)).toBe(true);
+  });
+
+  it.each(["person", "PERSON", "  Person\t"])("같은 클래스명 %s는 id가 달라도 적용을 막는다", (name) => {
+    const target = selected(7, name, TARGET_LANE);
+    expect(canApplyMeasurementSettings(true, ANCHOR_PERSON, target, true, true)).toBe(false);
+    expect(canApplyMeasurementSettings(false, ANCHOR_PERSON, target, true, true)).toBe(false);
+  });
+
+  it("공백·대소문자는 양쪽 이름 모두에 적용하고 다른 이름은 허용한다", () => {
+    const anchor = selected(0, "  PERSON\t", ANCHOR_LANE);
+    expect(canApplyMeasurementSettings(true, anchor, selected(7, "person", TARGET_LANE), true, true)).toBe(false);
+    expect(canApplyMeasurementSettings(true, anchor, TARGET_FORKLIFT, true, true)).toBe(true);
   });
 });
 
@@ -238,6 +250,15 @@ describe("restoreSelection", () => {
       classes: [ANCHOR_PERSON],
       dropped: true,
     });
+  });
+
+  it.each(["person", "PERSON", " person\t"])("각 레인에 유효해도 같은 이름 %s의 상대 선택은 폐기한다", (name) => {
+    const target = selected(7, name, TARGET_LANE);
+    const sameNameCatalog = { ...catalog, [TARGET_LANE]: [{ id: 7, name }] };
+    for (const stored of [[ANCHOR_PERSON, target], [target, ANCHOR_PERSON]]) {
+      expect(restoreSelection(stored, sameNameCatalog)).toEqual({ classes: [ANCHOR_PERSON], dropped: true });
+      expect(stored).toHaveLength(2);
+    }
   });
 });
 
@@ -306,5 +327,21 @@ describe("reconcileMeasurements", () => {
 
   it("빈 목록은 빈 결과를 돌려준다", () => {
     expect(reconcileMeasurements({}, catalog)).toEqual({ next: {}, disabled: [] });
+  });
+
+  it("같은 클래스명 저장값은 자동측정을 끄고 켜져 있던 카메라만 backend OFF 대상으로 보낸다", () => {
+    const target = selected(7, " PERSON ", TARGET_LANE);
+    const result = reconcileMeasurements({
+      "ipcam-on": { enabled: true, classes: [ANCHOR_PERSON, target] },
+      "ipcam-off": { enabled: false, classes: [ANCHOR_PERSON, target] },
+    }, { ...catalog, [TARGET_LANE]: [{ id: 7, name: " PERSON " }] });
+
+    expect(result).toEqual({
+      next: {
+        "ipcam-on": { enabled: false, classes: [ANCHOR_PERSON] },
+        "ipcam-off": { enabled: false, classes: [ANCHOR_PERSON] },
+      },
+      disabled: ["ipcam-on"],
+    });
   });
 });

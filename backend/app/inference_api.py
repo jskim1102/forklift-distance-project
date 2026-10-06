@@ -43,18 +43,14 @@ def get_inference_config() -> dict:
 
 @inference_router.put("/config", response_model=InferenceConfig)
 def update_inference_config(body: InferenceConfigUpdate) -> dict:
-    """추론 ON/OFF · 모델 · conf threshold 변경. 부분 업데이트 지원."""
-    if body.model is not None and (
-        not models_dir.is_lane(body.model) or body.model not in models_dir.get_active_lanes()
-    ):
+    """추론 ON/OFF · conf threshold · GPU 목표 변경. 부분 업데이트 지원."""
+    if "model" in body.model_fields_set:
         raise HTTPException(
             status_code=400,
-            detail="모델은 활성 레인 id(anchor·target)여야 합니다",
+            detail="이 API에서는 모델을 변경할 수 없습니다. 레인별 가중치 API를 사용하세요.",
         )
     if body.enabled is not None:
         stream_manager.set_inference_enabled(body.enabled)
-    if body.model is not None:
-        stream_manager.set_inference_model(body.model)
     if body.conf_threshold is not None:
         stream_manager.set_inference_conf_threshold(body.conf_threshold)
     if body.gpu_util_target is not None:
